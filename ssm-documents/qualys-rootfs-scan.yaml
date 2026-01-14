@@ -1,0 +1,255 @@
+schemaVersion: '2.2'
+description: 'Qualys QScanner - RootFS vulnerability scan for EC2 instances'
+parameters:
+  Pod:
+    type: String
+    default: 'US2'
+    description: 'Qualys POD identifier (US1, US2, US3, US4, EU1, EU2, IN1, etc.)'
+    allowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+  ScanTypes:
+    type: String
+    default: 'os,sca,fileinsight'
+    description: 'Comma-separated scan types (os, sca, fileinsight, secret)'
+  ExcludeDirs:
+    type: String
+    default: '/proc,/sys,/dev,/run,/tmp,/var/lib/docker,/var/lib/containers'
+    description: 'Directories to exclude from scanning'
+  S3Bucket:
+    type: String
+    description: 'S3 bucket for scan results'
+  SecretName:
+    type: String
+    default: 'qualys/qscanner-token'
+    description: 'Secrets Manager secret name containing Qualys credentials'
+  QScannerVersion:
+    type: String
+    default: 'latest'
+    description: 'QScanner version to use'
+  ScanMode:
+    type: String
+    default: 'get-report'
+    description: 'Scan mode (inventory-only, scan-only, get-report)'
+    allowedValues:
+      - inventory-only
+      - scan-only
+      - get-report
+
+mainSteps:
+  - action: aws:runShellScript
+    name: installQscanner
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '300'
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          QSCANNER_DIR="/opt/qualys"
+          QSCANNER_BIN="${QSCANNER_DIR}/qscanner"
+
+          # Create directory
+          mkdir -p ${QSCANNER_DIR}
+          cd ${QSCANNER_DIR}
+
+          # Get instance metadata
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+
+          if [ -n "$TOKEN" ]; then
+            REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/region)
+          else
+            REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+          fi
+
+          # Check if qscanner exists and get current version
+          CURRENT_VERSION=""
+          if [ -f "${QSCANNER_BIN}" ]; then
+            CURRENT_VERSION=$(${QSCANNER_BIN} --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+          fi
+
+          # Download qscanner if not present
+          if [ ! -f "${QSCANNER_BIN}" ]; then
+            echo "Downloading QScanner..."
+
+            # Detect architecture
+            ARCH=$(uname -m)
+            case $ARCH in
+              x86_64)
+                PLATFORM="linux-amd64"
+                ;;
+              aarch64|arm64)
+                PLATFORM="linux-arm64"
+                ;;
+              *)
+                echo "Unsupported architecture: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            # Download from Qualys (adjust URL as needed for your environment)
+            # Option 1: From S3 bucket
+            if aws s3 cp "s3://{{ S3Bucket }}/qscanner/qscanner-${PLATFORM}" ${QSCANNER_BIN} 2>/dev/null; then
+              echo "Downloaded from S3"
+            else
+              echo "QScanner binary not found. Please upload qscanner to s3://{{ S3Bucket }}/qscanner/"
+              exit 1
+            fi
+
+            chmod +x ${QSCANNER_BIN}
+          fi
+
+          # Verify installation
+          ${QSCANNER_BIN} --version
+          echo "QScanner installation verified"
+
+  - action: aws:runShellScript
+    name: runScan
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '900'
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          # Get instance metadata
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+
+          if [ -n "$TOKEN" ]; then
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+            REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/region)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-type)
+            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+          else
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+            PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+          fi
+
+          echo "Instance: ${INSTANCE_ID} (${INSTANCE_TYPE}) in ${AZ}"
+
+          # Get Qualys credentials from Secrets Manager
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "{{ SecretName }}" \
+            --region ${REGION} \
+            --query 'SecretString' \
+            --output text)
+
+          export QUALYS_ACCESS_TOKEN=$(echo $SECRET_JSON | jq -r '.access_token')
+
+          # Prepare output directory
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          OUTPUT_DIR="/tmp/qscanner-${INSTANCE_ID}-${TIMESTAMP}"
+          mkdir -p ${OUTPUT_DIR}
+
+          # Get system info for OS scan
+          UNAME_OUTPUT=$(uname -a)
+
+          # Run the scan
+          echo "Starting QScanner scan..."
+          echo "Scan types: {{ ScanTypes }}"
+          echo "Excluding: {{ ExcludeDirs }}"
+
+          /opt/qualys/qscanner \
+            --pod {{ Pod }} \
+            --mode {{ ScanMode }} \
+            --scan-types {{ ScanTypes }} \
+            --shell-commands "uname -a=${UNAME_OUTPUT}" \
+            --exclude-dirs {{ ExcludeDirs }} \
+            --scan-target-info "instance_id=${INSTANCE_ID}" \
+            --scan-target-info "region=${REGION}" \
+            --scan-target-info "availability_zone=${AZ}" \
+            --scan-target-info "instance_type=${INSTANCE_TYPE}" \
+            --scan-target-info "private_ip=${PRIVATE_IP}" \
+            --report-format json,sarif,table \
+            -o ${OUTPUT_DIR} \
+            rootfs /
+
+          SCAN_EXIT_CODE=$?
+          echo "Scan completed with exit code: ${SCAN_EXIT_CODE}"
+
+          # Save metadata
+          cat > ${OUTPUT_DIR}/scan-metadata.json << EOF
+          {
+            "instance_id": "${INSTANCE_ID}",
+            "region": "${REGION}",
+            "availability_zone": "${AZ}",
+            "instance_type": "${INSTANCE_TYPE}",
+            "private_ip": "${PRIVATE_IP}",
+            "scan_timestamp": "${TIMESTAMP}",
+            "scan_types": "{{ ScanTypes }}",
+            "pod": "{{ Pod }}",
+            "uname": "${UNAME_OUTPUT}",
+            "exit_code": ${SCAN_EXIT_CODE}
+          }
+          EOF
+
+          # Export for next step
+          echo "OUTPUT_DIR=${OUTPUT_DIR}" > /tmp/qscanner-env
+          echo "INSTANCE_ID=${INSTANCE_ID}" >> /tmp/qscanner-env
+          echo "REGION=${REGION}" >> /tmp/qscanner-env
+          echo "TIMESTAMP=${TIMESTAMP}" >> /tmp/qscanner-env
+
+  - action: aws:runShellScript
+    name: uploadResults
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '120'
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          # Load environment from previous step
+          source /tmp/qscanner-env
+
+          S3_PATH="s3://{{ S3Bucket }}/scans/${INSTANCE_ID}/${TIMESTAMP}/"
+
+          echo "Uploading results to ${S3_PATH}"
+
+          # Upload all results
+          aws s3 cp ${OUTPUT_DIR}/ ${S3_PATH} --recursive --region ${REGION}
+
+          echo "Results uploaded successfully"
+          echo "S3 Path: ${S3_PATH}"
+
+          # List uploaded files
+          aws s3 ls ${S3_PATH} --region ${REGION}
+
+          # Cleanup local files
+          rm -rf ${OUTPUT_DIR}
+          rm -f /tmp/qscanner-env
+
+          echo "Scan complete for ${INSTANCE_ID}"

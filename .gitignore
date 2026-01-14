@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# AWS
+.aws-sam/
+samconfig.toml
+
+# Logs
+*.log
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+*.zip
+dist/
+build/
+
+# Local binaries
+qscanner
+qscanner-*
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Secrets (never commit!)
+*.pem
+*.key
+secrets.json
+.env
+.env.*
