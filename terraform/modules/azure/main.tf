@@ -1,6 +1,3 @@
-# Qualys VM Scanner - Azure Module
-# Terraform alternative to Bicep for Azure deployments
-
 terraform {
   required_version = ">= 1.0"
   required_providers {
@@ -103,23 +100,39 @@ locals {
   key_vault_name       = "qualys-hub-${local.unique_suffix}"
 }
 
-# =============================================================================
-# HUB RESOURCES
-# =============================================================================
-
 resource "azurerm_storage_account" "results" {
-  count                    = var.deploy_hub ? 1 : 0
-  name                     = local.storage_account_name
-  resource_group_name      = var.resource_group_name
-  location                 = var.location
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
-  min_tls_version          = "TLS1_2"
+  count                           = var.deploy_hub ? 1 : 0
+  name                            = local.storage_account_name
+  resource_group_name             = var.resource_group_name
+  location                        = var.location
+  account_tier                    = "Standard"
+  account_replication_type        = "GRS"
+  min_tls_version                 = "TLS1_2"
+  https_traffic_only_enabled      = true
+  allow_nested_items_to_be_public = false
+  public_network_access_enabled   = false
+  shared_access_key_enabled       = false
 
   blob_properties {
     delete_retention_policy {
       days = 7
     }
+    versioning_enabled = true
+  }
+
+  queue_properties {
+    logging {
+      delete                = true
+      read                  = true
+      write                 = true
+      version               = "1.0"
+      retention_policy_days = 7
+    }
+  }
+
+  network_rules {
+    default_action = "Deny"
+    bypass         = ["AzureServices"]
   }
 }
 
@@ -150,14 +163,21 @@ resource "azurerm_storage_management_policy" "lifecycle" {
 }
 
 resource "azurerm_key_vault" "qualys" {
-  count                      = var.deploy_hub ? 1 : 0
-  name                       = local.key_vault_name
-  resource_group_name        = var.resource_group_name
-  location                   = var.location
-  tenant_id                  = data.azurerm_client_config.current.tenant_id
-  sku_name                   = "standard"
-  soft_delete_retention_days = 7
-  enable_rbac_authorization  = true
+  count                          = var.deploy_hub ? 1 : 0
+  name                           = local.key_vault_name
+  resource_group_name            = var.resource_group_name
+  location                       = var.location
+  tenant_id                      = data.azurerm_client_config.current.tenant_id
+  sku_name                       = "standard"
+  soft_delete_retention_days     = 90
+  purge_protection_enabled       = true
+  enable_rbac_authorization      = true
+  public_network_access_enabled  = false
+
+  network_acls {
+    default_action = "Deny"
+    bypass         = "AzureServices"
+  }
 }
 
 resource "azurerm_key_vault_secret" "qualys_pod" {
@@ -165,6 +185,9 @@ resource "azurerm_key_vault_secret" "qualys_pod" {
   name         = "qualys-pod"
   value        = var.qualys_pod
   key_vault_id = azurerm_key_vault.qualys[0].id
+  content_type = "text/plain"
+
+  expiration_date = timeadd(timestamp(), "8760h")
 }
 
 resource "azurerm_key_vault_secret" "qualys_token" {
@@ -172,19 +195,10 @@ resource "azurerm_key_vault_secret" "qualys_token" {
   name         = "qualys-access-token"
   value        = var.qualys_access_token
   key_vault_id = azurerm_key_vault.qualys[0].id
+  content_type = "text/plain"
+
+  expiration_date = timeadd(timestamp(), "8760h")
 }
-
-# =============================================================================
-# SPOKE RESOURCES (placeholder - expand as needed)
-# =============================================================================
-
-# Note: Full spoke implementation with Azure Functions, Event Grid, Automation
-# Account mirrors the Bicep template. For brevity, this module provides the
-# structure - expand as needed.
-
-# =============================================================================
-# OUTPUTS
-# =============================================================================
 
 output "hub_storage_account_name" {
   description = "Name of the hub storage account"

@@ -1,6 +1,3 @@
-// Qualys VM Scanner - Spoke (Per-Subscription Resources)
-// Deploys: Azure Functions + Event Grid + Automation Account for VM scanning
-
 @description('Location for all resources')
 param location string = resourceGroup().location
 
@@ -35,7 +32,6 @@ var storageAccountName = 'qualysfunc${uniqueSuffix}'
 var appInsightsName = 'qualys-insights-${uniqueSuffix}'
 var hostingPlanName = 'qualys-plan-${uniqueSuffix}'
 
-// Storage account for Function App
 resource functionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
   location: location
@@ -47,11 +43,14 @@ resource functionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
     allowBlobPublicAccess: false
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: 'Disabled'
+    networkAcls: {
+      defaultAction: 'Deny'
+      bypass: 'AzureServices'
+    }
   }
 }
 
-// Application Insights for monitoring
 resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   name: appInsightsName
   location: location
@@ -62,7 +61,6 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-// Consumption plan for Function App
 resource hostingPlan 'Microsoft.Web/serverfarms@2023-01-01' = {
   name: hostingPlanName
   location: location
@@ -73,7 +71,6 @@ resource hostingPlan 'Microsoft.Web/serverfarms@2023-01-01' = {
   properties: {}
 }
 
-// Function App for scan orchestration
 resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
   name: functionAppName
   location: location
@@ -83,8 +80,12 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
   }
   properties: {
     serverFarmId: hostingPlan.id
+    publicNetworkAccess: 'Disabled'
     siteConfig: {
       pythonVersion: '3.12'
+      http20Enabled: true
+      minTlsVersion: '1.2'
+      ftpsState: 'Disabled'
       appSettings: [
         {
           name: 'AzureWebJobsStorage'
@@ -132,7 +133,6 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
   }
 }
 
-// Automation Account for Run Command execution
 resource automationAccount 'Microsoft.Automation/automationAccounts@2023-11-01' = {
   name: automationAccountName
   location: location
@@ -149,7 +149,6 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2023-11-01' 
   }
 }
 
-// Runbook for executing Qualys scan on VMs
 resource scanRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11-01' = {
   parent: automationAccount
   name: 'Invoke-QualysScan'
@@ -165,7 +164,6 @@ resource scanRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11-0
   }
 }
 
-// Event Grid System Topic for VM events (if enabled)
 resource eventGridTopic 'Microsoft.EventGrid/systemTopics@2023-12-15-preview' = if (enableNewVmTrigger) {
   name: 'qualys-vm-events-${uniqueSuffix}'
   location: 'global'
@@ -175,7 +173,6 @@ resource eventGridTopic 'Microsoft.EventGrid/systemTopics@2023-12-15-preview' = 
   }
 }
 
-// Event Grid Subscription for new VM events
 resource vmEventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@2023-12-15-preview' = if (enableNewVmTrigger) {
   parent: eventGridTopic
   name: 'new-vm-trigger'
@@ -209,7 +206,6 @@ resource vmEventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscription
   }
 }
 
-// Schedule for automated scans (if enabled)
 resource scanSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-11-01' = if (enableScheduledScan) {
   parent: automationAccount
   name: 'daily-scan'
@@ -221,7 +217,6 @@ resource scanSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-11
   }
 }
 
-// Role assignment: Function App needs VM Contributor to invoke Run Command
 resource functionVmContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, functionApp.id, 'vm-contributor')
   properties: {
@@ -231,7 +226,6 @@ resource functionVmContributor 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
-// Role assignment: Automation Account needs VM Contributor
 resource automationVmContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, automationAccount.id, 'vm-contributor')
   properties: {
@@ -241,7 +235,6 @@ resource automationVmContributor 'Microsoft.Authorization/roleAssignments@2022-0
   }
 }
 
-// Outputs
 output functionAppName string = functionApp.name
 output functionAppPrincipalId string = functionApp.identity.principalId
 output automationAccountName string = automationAccount.name

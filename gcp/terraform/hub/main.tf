@@ -1,6 +1,3 @@
-# Qualys VM Scanner - Hub (Central Resources)
-# Deploys: Cloud Storage + Secret Manager for centralized credential and result storage
-
 terraform {
   required_version = ">= 1.0"
   required_providers {
@@ -61,7 +58,6 @@ locals {
   log_bucket_name = "qualys-ssm-logs-${var.project_id}"
 }
 
-# Cloud Storage bucket for access logs
 resource "google_storage_bucket" "logs" {
   name                        = local.log_bucket_name
   project                     = var.project_id
@@ -69,6 +65,10 @@ resource "google_storage_bucket" "logs" {
   force_destroy               = true
   uniform_bucket_level_access = true
   public_access_prevention    = "enforced"
+
+  versioning {
+    enabled = true
+  }
 
   lifecycle_rule {
     condition {
@@ -78,9 +78,17 @@ resource "google_storage_bucket" "logs" {
       type = "Delete"
     }
   }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 3
+    }
+    action {
+      type = "Delete"
+    }
+  }
 }
 
-# Cloud Storage bucket for scan results
 resource "google_storage_bucket" "results" {
   name                        = local.bucket_name
   project                     = var.project_id
@@ -114,13 +122,8 @@ resource "google_storage_bucket" "results" {
       type = "Delete"
     }
   }
-
-  encryption {
-    default_kms_key_name = null # Uses Google-managed encryption
-  }
 }
 
-# Secret Manager secret for Qualys credentials
 resource "google_secret_manager_secret" "qualys_credentials" {
   project   = var.project_id
   secret_id = "qualys-ssm-scanner-credentials"
@@ -130,7 +133,6 @@ resource "google_secret_manager_secret" "qualys_credentials" {
   }
 }
 
-# Store the credentials as a JSON secret version
 resource "google_secret_manager_secret_version" "qualys_credentials" {
   secret = google_secret_manager_secret.qualys_credentials.id
   secret_data = jsonencode({
@@ -139,8 +141,6 @@ resource "google_secret_manager_secret_version" "qualys_credentials" {
   })
 }
 
-# IAM binding for cross-project access to storage bucket
-# Spoke projects' service accounts will need storage.objectCreator role
 resource "google_storage_bucket_iam_member" "spoke_access" {
   count  = var.allowed_org_id != "" ? 1 : 0
   bucket = google_storage_bucket.results.name
@@ -148,7 +148,6 @@ resource "google_storage_bucket_iam_member" "spoke_access" {
   member = "domain:${var.allowed_org_id}"
 }
 
-# Outputs for spoke deployment
 output "bucket_name" {
   description = "Name of the results storage bucket"
   value       = google_storage_bucket.results.name

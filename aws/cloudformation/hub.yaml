@@ -10,25 +10,149 @@ Parameters:
     Type: String
     Description: ARN of the Qualys credentials secret
 
+  ResultRetentionDays:
+    Type: Number
+    Default: 90
+    Description: Days to retain scan results
+
+  LogRetentionDays:
+    Type: Number
+    Default: 365
+    Description: Days to retain access logs
+
 Resources:
-  ResultsBucket:
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Qualys SSM Scanner encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow S3 service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: Allow organization access
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/qualys-ssm-scanner
+      TargetKeyId: !Ref KMSKey
+
+  LogsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub qualys-ssm-hub-${AWS::AccountId}
+      BucketName: !Sub qualys-ssm-logs-${AWS::AccountId}
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+            BucketKeyEnabled: true
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${LogsBucket.Arn}/*
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::qualys-ssm-hub-${AWS::AccountId}
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecure
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub ${LogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LogsBucketPolicy
+    Properties:
+      BucketName: !Sub qualys-ssm-hub-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3-access-logs/
       LifecycleConfiguration:
         Rules:
           - Id: ExpireResults
             Status: Enabled
-            ExpirationInDays: 90
+            ExpirationInDays: !Ref ResultRetentionDays
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
 
   ResultsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -84,6 +208,21 @@ Outputs:
     Value: !GetAtt ResultsBucket.Arn
     Export:
       Name: qualys-ssm-hub-bucket-arn
+
+  LogsBucketName:
+    Value: !Ref LogsBucket
+    Export:
+      Name: qualys-ssm-logs-bucket
+
+  KMSKeyArn:
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: qualys-ssm-kms-key-arn
+
+  KMSKeyId:
+    Value: !Ref KMSKey
+    Export:
+      Name: qualys-ssm-kms-key-id
 
   SecretArn:
     Value: !Ref SecretArn

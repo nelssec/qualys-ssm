@@ -1,6 +1,3 @@
-# Qualys VM Scanner - Spoke (Per-Project Resources)
-# Deploys: Cloud Functions + Pub/Sub + Cloud Scheduler for VM scanning
-
 terraform {
   required_version = ">= 1.0"
   required_providers {
@@ -65,7 +62,6 @@ locals {
   function_name = "qualys-vm-scanner"
 }
 
-# Enable required APIs
 resource "google_project_service" "apis" {
   for_each = toset([
     "cloudfunctions.googleapis.com",
@@ -81,14 +77,12 @@ resource "google_project_service" "apis" {
   service = each.value
 }
 
-# Service account for Cloud Function
 resource "google_service_account" "scanner" {
   project      = var.project_id
   account_id   = "qualys-scanner"
   display_name = "Qualys VM Scanner"
 }
 
-# IAM: Scanner can read secrets from hub project
 resource "google_secret_manager_secret_iam_member" "scanner_secret_access" {
   project   = var.hub_project_id
   secret_id = var.hub_secret_id
@@ -96,21 +90,18 @@ resource "google_secret_manager_secret_iam_member" "scanner_secret_access" {
   member    = "serviceAccount:${google_service_account.scanner.email}"
 }
 
-# IAM: Scanner can write to hub bucket
 resource "google_storage_bucket_iam_member" "scanner_bucket_access" {
   bucket = var.hub_bucket_name
   role   = "roles/storage.objectCreator"
   member = "serviceAccount:${google_service_account.scanner.email}"
 }
 
-# IAM: Scanner can invoke commands on VMs
 resource "google_project_iam_member" "scanner_compute_admin" {
   project = var.project_id
   role    = "roles/compute.instanceAdmin.v1"
   member  = "serviceAccount:${google_service_account.scanner.email}"
 }
 
-# Pub/Sub topic for scan triggers with CMEK (using Google-managed key)
 resource "google_pubsub_topic" "scan_trigger" {
   project = var.project_id
   name    = "qualys-scan-trigger"
@@ -118,7 +109,6 @@ resource "google_pubsub_topic" "scan_trigger" {
   message_retention_duration = "86400s"
 }
 
-# Pub/Sub subscription for the function
 resource "google_pubsub_subscription" "scan_trigger" {
   project = var.project_id
   name    = "qualys-scan-trigger-sub"
@@ -137,7 +127,6 @@ resource "google_pubsub_subscription" "scan_trigger" {
   }
 }
 
-# Cloud Storage bucket for function source with security settings
 resource "google_storage_bucket" "function_source" {
   project                     = var.project_id
   name                        = "qualys-scanner-source-${var.project_id}"
@@ -169,7 +158,6 @@ resource "google_storage_bucket" "function_source" {
   }
 }
 
-# Cloud Function (Gen2) for scan orchestration
 resource "google_cloudfunctions2_function" "scanner" {
   project  = var.project_id
   name     = local.function_name
@@ -187,13 +175,13 @@ resource "google_cloudfunctions2_function" "scanner" {
   }
 
   service_config {
-    max_instance_count               = 10
-    min_instance_count               = 0
-    available_memory                 = "256M"
-    timeout_seconds                  = 540
-    service_account_email            = google_service_account.scanner.email
-    ingress_settings                 = "ALLOW_INTERNAL_AND_GCLB"
-    all_traffic_on_latest_revision   = true
+    max_instance_count             = 10
+    min_instance_count             = 0
+    available_memory               = "256M"
+    timeout_seconds                = 540
+    service_account_email          = google_service_account.scanner.email
+    ingress_settings               = "ALLOW_INTERNAL_AND_GCLB"
+    all_traffic_on_latest_revision = true
 
     environment_variables = {
       HUB_PROJECT_ID  = var.hub_project_id
@@ -214,7 +202,6 @@ resource "google_cloudfunctions2_function" "scanner" {
   depends_on = [google_project_service.apis]
 }
 
-# Cloud Scheduler for daily scans
 resource "google_cloud_scheduler_job" "daily_scan" {
   count = var.enable_scheduled_scan ? 1 : 0
 
@@ -233,7 +220,6 @@ resource "google_cloud_scheduler_job" "daily_scan" {
   depends_on = [google_project_service.apis]
 }
 
-# Log sink for new VM events (triggers scan on VM creation)
 resource "google_logging_project_sink" "new_vm_sink" {
   count = var.enable_new_vm_trigger ? 1 : 0
 
@@ -250,7 +236,6 @@ resource "google_logging_project_sink" "new_vm_sink" {
   unique_writer_identity = true
 }
 
-# Grant the log sink permission to publish to Pub/Sub
 resource "google_pubsub_topic_iam_member" "sink_publisher" {
   count = var.enable_new_vm_trigger ? 1 : 0
 
@@ -260,7 +245,6 @@ resource "google_pubsub_topic_iam_member" "sink_publisher" {
   member  = google_logging_project_sink.new_vm_sink[0].writer_identity
 }
 
-# Outputs
 output "function_name" {
   description = "Name of the scanner Cloud Function"
   value       = google_cloudfunctions2_function.scanner.name

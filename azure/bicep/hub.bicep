@@ -1,6 +1,3 @@
-// Qualys VM Scanner - Hub (Central Resources)
-// Deploys: Storage Account + Key Vault for centralized credential and result storage
-
 @description('Location for all resources')
 param location string = resourceGroup().location
 
@@ -23,7 +20,6 @@ var storageAccountName = 'qualysscan${uniqueSuffix}'
 var keyVaultName = 'qualys-hub-${uniqueSuffix}'
 var secretExpiration = dateTimeAdd(utcNow(), 'P${secretExpirationDays}D')
 
-// Storage Account for scan results
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
   location: location
@@ -36,15 +32,14 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
     allowBlobPublicAccess: false
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: 'Disabled'
     networkAcls: {
-      defaultAction: 'Allow'
+      defaultAction: 'Deny'
       bypass: 'AzureServices'
     }
   }
 }
 
-// Blob service with logging and lifecycle management
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-01-01' = {
   parent: storageAccount
   name: 'default'
@@ -56,14 +51,12 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-01-01'
   }
 }
 
-// Queue service for logging
 resource queueService 'Microsoft.Storage/storageAccounts/queueServices@2023-01-01' = {
   parent: storageAccount
   name: 'default'
   properties: {}
 }
 
-// Container for scan results
 resource scansContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-01-01' = {
   parent: blobService
   name: 'scans'
@@ -72,7 +65,6 @@ resource scansContainer 'Microsoft.Storage/storageAccounts/blobServices/containe
   }
 }
 
-// Lifecycle management policy for result retention
 resource lifecyclePolicy 'Microsoft.Storage/storageAccounts/managementPolicies@2023-01-01' = {
   parent: storageAccount
   name: 'default'
@@ -102,7 +94,6 @@ resource lifecyclePolicy 'Microsoft.Storage/storageAccounts/managementPolicies@2
   }
 }
 
-// Key Vault for Qualys credentials
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: keyVaultName
   location: location
@@ -116,14 +107,14 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     enableSoftDelete: true
     enablePurgeProtection: true
     softDeleteRetentionInDays: 90
+    publicNetworkAccess: 'Disabled'
     networkAcls: {
-      defaultAction: 'Allow'
+      defaultAction: 'Deny'
       bypass: 'AzureServices'
     }
   }
 }
 
-// Store Qualys credentials as secrets with expiration and content type
 resource qualysPodSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: keyVault
   name: 'qualys-pod'
@@ -150,7 +141,6 @@ resource qualysTokenSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   }
 }
 
-// Outputs for spoke deployment
 output storageAccountName string = storageAccount.name
 output storageAccountId string = storageAccount.id
 output scansContainerName string = scansContainer.name

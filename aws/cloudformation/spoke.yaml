@@ -14,6 +14,11 @@ Parameters:
     Type: String
     Description: Hub Secrets Manager ARN
 
+  HubKMSKeyArn:
+    Type: String
+    Description: Hub KMS Key ARN for encryption
+    Default: ''
+
   ScanTypes:
     Type: String
     Default: os,sca,fileinsight
@@ -37,18 +42,90 @@ Parameters:
     Default: 10
     Description: Reserved concurrent executions for Lambda functions
 
+  VpcId:
+    Type: String
+    Default: ''
+    Description: VPC ID for Lambda functions (leave empty for no VPC)
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of subnet IDs for Lambda functions
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of security group IDs for Lambda functions
+
 Conditions:
   CreateNewEC2Trigger: !Equals [!Ref EnableNewEC2Trigger, 'true']
   CreateScheduledTrigger: !Equals [!Ref EnableScheduledScan, 'true']
+  UseVpc: !Not [!Equals [!Ref VpcId, '']]
+  UseHubKMS: !Not [!Equals [!Ref HubKMSKeyArn, '']]
 
 Resources:
-  # Dead Letter Queue for Lambda failures
+  SpokeKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Qualys SSM Scanner spoke encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Lambda service
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: Allow SQS service
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+
+  SpokeKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/qualys-ssm-spoke
+      TargetKeyId: !Ref SpokeKMSKey
+
   LambdaDLQ:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: qualys-ssm-dlq
       MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !Ref SpokeKMSKey
+      KmsDataKeyReusePeriodSeconds: 86400
+
+  LambdaDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref LambdaDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaDLQ
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDLQ.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:qualys-ssm-*
 
   SSMDocument:
     Type: AWS::SSM::Document
@@ -164,6 +241,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If [UseVpc, 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole', !Ref 'AWS::NoValue']
       Policies:
         - PolicyName: SSMScanner
           PolicyDocument:
@@ -195,6 +273,12 @@ Resources:
                 Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt LambdaDLQ.Arn
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt SpokeKMSKey.Arn
 
   CheckSSMLambda:
     Type: AWS::Lambda::Function
@@ -207,6 +291,12 @@ Resources:
       ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
       DeadLetterConfig:
         TargetArn: !GetAtt LambdaDLQ.Arn
+      KmsKeyArn: !GetAtt SpokeKMSKey.Arn
+      VpcConfig: !If
+        - UseVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref 'AWS::NoValue'
       Code:
         ZipFile: |
           import boto3
@@ -234,6 +324,12 @@ Resources:
       ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
       DeadLetterConfig:
         TargetArn: !GetAtt LambdaDLQ.Arn
+      KmsKeyArn: !GetAtt SpokeKMSKey.Arn
+      VpcConfig: !If
+        - UseVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref 'AWS::NoValue'
       Environment:
         Variables:
           SSM_DOCUMENT: !Ref SSMDocument
@@ -260,6 +356,12 @@ Resources:
       ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
       DeadLetterConfig:
         TargetArn: !GetAtt LambdaDLQ.Arn
+      KmsKeyArn: !GetAtt SpokeKMSKey.Arn
+      VpcConfig: !If
+        - UseVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref 'AWS::NoValue'
       Environment:
         Variables:
           STATE_MACHINE_ARN: !Ref ScanStateMachine
@@ -444,6 +546,15 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref HubSecretArn
+              - !If
+                - UseHubKMS
+                - Sid: KMSAccess
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey*
+                  Resource: !Ref HubKMSKeyArn
+                - !Ref 'AWS::NoValue'
 
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -463,3 +574,6 @@ Outputs:
 
   DLQArn:
     Value: !GetAtt LambdaDLQ.Arn
+
+  SpokeKMSKeyArn:
+    Value: !GetAtt SpokeKMSKey.Arn

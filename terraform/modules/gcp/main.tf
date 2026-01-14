@@ -1,6 +1,3 @@
-# Qualys VM Scanner - GCP Module
-# Wrapper module referencing the native GCP Terraform in gcp/terraform/
-
 terraform {
   required_version = ">= 1.0"
   required_providers {
@@ -95,12 +92,41 @@ variable "result_retention_days" {
 }
 
 locals {
-  bucket_name = var.deploy_hub ? "qualys-ssm-hub-${var.project_id}" : var.hub_bucket_name
+  bucket_name     = var.deploy_hub ? "qualys-ssm-hub-${var.project_id}" : var.hub_bucket_name
+  log_bucket_name = "qualys-ssm-logs-${var.project_id}"
 }
 
-# =============================================================================
-# HUB RESOURCES
-# =============================================================================
+resource "google_storage_bucket" "logs" {
+  count                       = var.deploy_hub ? 1 : 0
+  name                        = local.log_bucket_name
+  project                     = var.project_id
+  location                    = var.region
+  force_destroy               = true
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 3
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
 
 resource "google_storage_bucket" "results" {
   count                       = var.deploy_hub ? 1 : 0
@@ -109,6 +135,15 @@ resource "google_storage_bucket" "results" {
   location                    = var.region
   force_destroy               = false
   uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  versioning {
+    enabled = true
+  }
+
+  logging {
+    log_bucket = google_storage_bucket.logs[0].name
+  }
 
   lifecycle_rule {
     condition {
@@ -117,6 +152,19 @@ resource "google_storage_bucket" "results" {
     action {
       type = "Delete"
     }
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 3
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  encryption {
+    default_kms_key_name = null
   }
 }
 
@@ -139,18 +187,6 @@ resource "google_secret_manager_secret_version" "qualys" {
   })
 }
 
-# =============================================================================
-# SPOKE RESOURCES (placeholder - expand as needed)
-# =============================================================================
-
-# Note: Full spoke implementation with Cloud Functions, Pub/Sub, Cloud Scheduler
-# mirrors gcp/terraform/spoke. For brevity, this module provides the structure -
-# expand as needed.
-
-# =============================================================================
-# OUTPUTS
-# =============================================================================
-
 output "hub_bucket_name" {
   description = "Name of the hub storage bucket"
   value       = var.deploy_hub ? google_storage_bucket.results[0].name : var.hub_bucket_name
@@ -169,4 +205,9 @@ output "hub_secret_id" {
 output "hub_project_id" {
   description = "Hub project ID"
   value       = var.project_id
+}
+
+output "hub_log_bucket_name" {
+  description = "Name of the hub access logs bucket"
+  value       = var.deploy_hub ? google_storage_bucket.logs[0].name : null
 }

@@ -631,24 +631,87 @@ Within minutes of VM launch, you'll see:
 ```mermaid
 flowchart TB
     subgraph Hub["Hub (Trusted)"]
-        CREDS["Credentials<br/>Read-only from spokes"]
-        RESULTS["Results<br/>Write-only from spokes"]
+        KMS["KMS Encryption<br/>Key Rotation Enabled"]
+        CREDS["Credentials<br/>KMS Encrypted"]
+        RESULTS["Results<br/>Versioned + Logged"]
+        LOGS["Access Logs<br/>Encrypted + Retained"]
     end
 
     subgraph Spoke["Spoke (Minimal)"]
-        SCAN["Scanner<br/>No stored credentials"]
+        DLQ["Dead Letter Queue<br/>KMS Encrypted"]
+        SCAN["Scanner Functions<br/>Environment Encrypted"]
     end
 
-    Spoke -->|"Get token"| CREDS
-    Spoke -->|"Upload scan"| RESULTS
+    RESULTS --> LOGS
+    Spoke -->|"Get token<br/>TLS Required"| CREDS
+    Spoke -->|"Upload scan<br/>TLS Required"| RESULTS
 ```
 
-- Credentials never stored in spoke accounts
-- Spokes have minimal permissions (read creds, write results)
-- All storage encrypted at rest
-- TLS enforced on all API calls
-- No persistent processes on VMs
-- QScanner binary verified via SHA256 checksum
+### Encryption at Rest
+
+| Cloud | Resource | Encryption |
+|-------|----------|------------|
+| **AWS** | S3 Buckets | KMS with customer-managed key, key rotation enabled |
+| **AWS** | Secrets Manager | KMS with customer-managed key |
+| **AWS** | SQS (DLQ) | KMS encryption |
+| **AWS** | Lambda Environment | KMS encryption for environment variables |
+| **Azure** | Storage Account | GRS replication, TLS 1.2 minimum |
+| **Azure** | Key Vault | Purge protection enabled, 90-day soft delete |
+| **GCP** | Cloud Storage | Google-managed encryption, versioning enabled |
+| **GCP** | Secret Manager | Automatic encryption with auto-replication |
+
+### Network Security
+
+| Cloud | Control | Implementation |
+|-------|---------|----------------|
+| **AWS** | Transport | TLS required via bucket policy (`aws:SecureTransport`) |
+| **AWS** | VPC Support | Optional VPC configuration for Lambda functions |
+| **AWS** | Cross-Account | Organization-scoped access via `aws:PrincipalOrgID` |
+| **Azure** | Network Rules | Storage and Key Vault default deny, Azure Services bypass |
+| **Azure** | Public Access | Disabled on storage accounts and Key Vault |
+| **Azure** | Function Ingress | HTTPS only, HTTP/2 enabled, FTPS disabled |
+| **GCP** | Public Access | `public_access_prevention = enforced` on all buckets |
+| **GCP** | Function Ingress | `ALLOW_INTERNAL_AND_GCLB` restricts external access |
+
+### Access Controls
+
+| Cloud | Control | Implementation |
+|-------|---------|----------------|
+| **AWS** | IAM Policies | Least-privilege, scoped to specific resources |
+| **AWS** | S3 Block Public | All public access blocked on all buckets |
+| **Azure** | RBAC | Key Vault uses RBAC authorization |
+| **Azure** | Managed Identity | System-assigned identities for Functions and Automation |
+| **GCP** | IAM | Service account with minimal cross-project permissions |
+| **GCP** | Uniform Access | Bucket-level access only, no ACLs |
+
+### Data Lifecycle
+
+| Control | AWS | Azure | GCP |
+|---------|-----|-------|-----|
+| **Result Retention** | 90 days (configurable) | 90 days (configurable) | 90 days (configurable) |
+| **Log Retention** | 365 days | 30 days | 30 days |
+| **Versioning** | Enabled with 30-day noncurrent expiration | 7-day soft delete | 3 version retention |
+| **Incomplete Uploads** | Aborted after 7 days | N/A | N/A |
+
+### Secret Management
+
+| Cloud | Feature | Implementation |
+|-------|---------|----------------|
+| **AWS** | Encryption | KMS customer-managed key |
+| **AWS** | Cross-Account | Organization-scoped resource policy |
+| **Azure** | Protection | Purge protection + 90-day soft delete |
+| **Azure** | Expiration | 1-year expiration on all secrets |
+| **Azure** | Content Type | Set on all secrets for proper handling |
+| **GCP** | Replication | Automatic multi-region replication |
+| **GCP** | Access | IAM-based, project-scoped |
+
+### Operational Security
+
+- **Dead Letter Queues**: Failed Lambda invocations captured for analysis
+- **Reserved Concurrency**: Lambda functions have execution limits to prevent runaway costs
+- **Binary Verification**: QScanner SHA256 checksum validated before execution
+- **No Persistent Agents**: Scanner runs on-demand, no always-on processes
+- **Credential Isolation**: Spoke accounts never store credentials locally
 
 ## Get Started
 
