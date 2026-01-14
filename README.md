@@ -1,87 +1,53 @@
 # Qualys SSM Scanner
 
-Automated vulnerability scanning for EC2 instances using AWS Systems Manager and Qualys QScanner.
+Automated EC2 vulnerability scanning using Qualys QScanner and AWS Systems Manager.
 
 ## Architecture
 
 ```
-EventBridge (New EC2 / Schedule)
-         │
-         ▼
-    Lambda Trigger
-         │
-         ▼
-    SSM Run Command
-         │
-         ▼
-   EC2 Instances (qscanner rootfs /)
-         │
-         ├──► Qualys Dashboard (vulnerability results)
-         └──► S3 Bucket (scan artifacts)
+EventBridge ──► Lambda ──► SSM Run Command ──► EC2 (qscanner rootfs /)
+    │                                              │
+    │                                              ▼
+    │                                         Qualys API
+    │                                              │
+    └──────────────────────────────────────────────┴──► S3 (results)
 ```
 
-## Components
-
-| Component | Description |
-|-----------|-------------|
-| `ssm-documents/` | SSM Command documents for scanning |
-| `lambda/` | Trigger Lambda function |
-| `cloudformation/` | Infrastructure as Code |
-| `scripts/` | Helper scripts for deployment |
-
-## Prerequisites
-
-1. Qualys subscription with Container Security
-2. Qualys API credentials stored in Secrets Manager
-3. EC2 instances with SSM Agent installed
-4. IAM roles for EC2 and Lambda
-
-## Quick Start
+## Deploy
 
 ```bash
-# 1. Store Qualys credentials (if not already done)
-aws secretsmanager create-secret \
-  --name qualys/qscanner-token \
-  --secret-string '{"access_token":"YOUR_TOKEN","pod":"US2"}'
+QUALYS_TOKEN=your-token make deploy
+```
 
-# 2. Deploy CloudFormation stack
-make deploy
+## Post-Deploy: Upload QScanner
 
-# 3. Test with a specific instance
-make scan-instance INSTANCE_ID=i-0abc123
+```bash
+aws s3 cp qscanner-linux-amd64 s3://BUCKET/qscanner/
+aws s3 cp qscanner-linux-arm64 s3://BUCKET/qscanner/
+```
 
-# 4. Scan all tagged instances
+## Scan
+
+```bash
+# Single instance
+INSTANCE_ID=i-xxx make scan-instance
+
+# All tagged instances (QualysScan=enabled)
 make scan-fleet
 ```
 
-## Scan Types
+## Parameters
 
-- `os` - Operating system package vulnerabilities
-- `sca` - Software Composition Analysis (JARs, Node modules, etc.)
-- `fileinsight` - File metadata and configuration analysis
-
-## Configuration
-
-Environment variables for Lambda:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QUALYS_POD` | `US2` | Qualys platform identifier |
-| `SCAN_TYPES` | `os,sca,fileinsight` | Scan types to perform |
-| `S3_BUCKET` | (from CFN) | Results bucket |
-| `SECRET_NAME` | `qualys/qscanner-token` | Secrets Manager secret |
-
-## Triggers
-
-1. **New EC2 Instance** - Automatically scans when instance enters `running` state
-2. **Scheduled** - Daily fleet-wide scan (configurable)
-3. **Manual** - On-demand via Lambda invocation or SSM console
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| QualysAccessToken | - | Qualys API token |
+| QualysPod | US2 | Qualys platform |
+| ScanTypes | os,sca,fileinsight | Scan types |
+| EnableNewEC2Trigger | true | Auto-scan new instances |
+| EnableScheduledScan | true | Daily fleet scan |
+| ScheduleExpression | cron(0 2 * * ? *) | Schedule |
 
 ## Tagging
 
-Tag EC2 instances to control scanning:
-
-| Tag | Value | Effect |
-|-----|-------|--------|
-| `QualysScan` | `enabled` | Include in scheduled scans |
-| `QualysScan` | `disabled` | Exclude from all scans |
+- `QualysScan=enabled` - Include in fleet scans
+- `QualysScan=disabled` - Exclude from all scans
