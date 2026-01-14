@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Qualys SSM Scanner - Spoke Account (StackSet Template)
+
+Parameters:
+  HubAccountId:
+    Type: String
+    Description: Hub account ID
+
+  HubBucketName:
+    Type: String
+    Description: Hub S3 bucket name
+
+  HubSecretArn:
+    Type: String
+    Description: Hub Secrets Manager ARN
+
+  ScanTypes:
+    Type: String
+    Default: os,sca,fileinsight
+
+  EnableNewEC2Trigger:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableScheduledScan:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 2 * * ? *)
+
+Conditions:
+  CreateNewEC2Trigger: !Equals [!Ref EnableNewEC2Trigger, 'true']
+  CreateScheduledTrigger: !Equals [!Ref EnableScheduledScan, 'true']
+
+Resources:
+  SSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: qualys-ssm-scan
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '2.2'
+        description: Qualys QScanner RootFS scan
+        parameters:
+          HubBucket:
+            type: String
+            default: !Ref HubBucketName
+          HubSecretArn:
+            type: String
+            default: !Ref HubSecretArn
+          ScanTypes:
+            type: String
+            default: !Ref ScanTypes
+        mainSteps:
+          - action: aws:runShellScript
+            name: scan
+            precondition:
+              StringEquals: [platformType, Linux]
+            inputs:
+              timeoutSeconds: '900'
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -e
+                  QSCANNER="/opt/qualys/qscanner"
+                  mkdir -p /opt/qualys
+                  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+                  if [ -n "$TOKEN" ]; then
+                    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                    REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+                    INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+                  else
+                    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                    INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+                  fi
+                  ACCOUNT_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r '.accountId')
+                  ARCH=$(uname -m)
+                  case $ARCH in
+                    x86_64) PLATFORM="linux-amd64" ;;
+                    aarch64|arm64) PLATFORM="linux-arm64" ;;
+                    *) echo "Unsupported: $ARCH"; exit 1 ;;
+                  esac
+                  case $PLATFORM in
+                    linux-amd64) QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz" ;;
+                    linux-arm64) QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner-arm64.gz" ;;
+                  esac
+                  QSCANNER_SHA="/opt/qualys/qscanner.sha256"
+                  REFRESH_DAYS=30
+                  NEED_DOWNLOAD=false
+                  if [ ! -f "$QSCANNER" ]; then
+                    NEED_DOWNLOAD=true
+                  else
+                    FILE_AGE=$(( ($(date +%s) - $(stat -c %Y "$QSCANNER")) / 86400 ))
+                    if [ "$FILE_AGE" -gt "$REFRESH_DAYS" ]; then
+                      echo "Binary is ${FILE_AGE} days old, checking for updates..."
+                      LOCAL_SHA=$(cat "$QSCANNER_SHA" 2>/dev/null || echo "")
+                      REMOTE_SHA=$(curl -sL "${QSCANNER_URL}.sha256" 2>/dev/null || echo "")
+                      if [ -n "$LOCAL_SHA" ] && [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+                        echo "No update available, resetting cache timer"
+                        touch "$QSCANNER"
+                      else
+                        echo "New version available, downloading..."
+                        NEED_DOWNLOAD=true
+                      fi
+                    fi
+                  fi
+                  if [ "$NEED_DOWNLOAD" = "true" ]; then
+                    curl -sL "$QSCANNER_URL" -o /tmp/qscanner.gz
+                    sha256sum /tmp/qscanner.gz | awk '{print $1}' > "$QSCANNER_SHA"
+                    gunzip -c /tmp/qscanner.gz > $QSCANNER
+                    chmod +x $QSCANNER
+                    rm -f /tmp/qscanner.gz
+                  fi
+                  SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "{{ HubSecretArn }}" --region $REGION --query 'SecretString' --output text)
+                  export QUALYS_ACCESS_TOKEN=$(echo $SECRET_JSON | jq -r '.qualys_access_token')
+                  POD=$(echo $SECRET_JSON | jq -r '.qualys_pod')
+                  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+                  OUTPUT="/tmp/qscanner-${INSTANCE_ID}-${TIMESTAMP}"
+                  mkdir -p $OUTPUT
+                  $QSCANNER \
+                    --pod $POD \
+                    --mode get-report \
+                    --scan-types {{ ScanTypes }} \
+                    --shell-commands "uname -a=$(uname -a)" \
+                    --exclude-dirs /proc,/sys,/dev,/run,/tmp,/var/lib/docker \
+                    --scan-target-info "instance_id=${INSTANCE_ID}" \
+                    --scan-target-info "account_id=${ACCOUNT_ID}" \
+                    --scan-target-info "region=${REGION}" \
+                    --scan-target-info "instance_type=${INSTANCE_TYPE}" \
+                    --report-format json,sarif \
+                    -o $OUTPUT \
+                    rootfs /
+                  aws s3 cp $OUTPUT/ "s3://{{ HubBucket }}/scans/${ACCOUNT_ID}/${INSTANCE_ID}/${TIMESTAMP}/" --recursive --region $REGION
+                  rm -rf $OUTPUT
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMScanner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:SendCommand, ssm:DescribeInstanceInformation, ssm:GetCommandInvocation]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:DescribeTags]
+                Resource: '*'
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ScanStateMachine
+
+  CheckSSMLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qualys-ssm-check
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          ssm = boto3.client('ssm')
+          def handler(event, context):
+              ids = event.get('instance_ids', [])
+              if not ids:
+                  return {'ready': [], 'not_ready': ids}
+              try:
+                  r = ssm.describe_instance_information(Filters=[{'Key': 'InstanceIds', 'Values': ids[:50]}])
+                  ready = [i['InstanceId'] for i in r['InstanceInformationList'] if i['PingStatus'] == 'Online']
+                  not_ready = [i for i in ids if i not in ready]
+                  return {'ready': ready, 'not_ready': not_ready}
+              except:
+                  return {'ready': [], 'not_ready': ids}
+
+  SendCommandLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qualys-ssm-send
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SSM_DOCUMENT: !Ref SSMDocument
+      Code:
+        ZipFile: |
+          import boto3, os
+          ssm = boto3.client('ssm')
+          def handler(event, context):
+              ids = event.get('ready', [])
+              if not ids:
+                  return {'status': 'no_targets'}
+              doc = os.environ['SSM_DOCUMENT']
+              r = ssm.send_command(InstanceIds=ids, DocumentName=doc, TimeoutSeconds=900, MaxConcurrency='10', MaxErrors='50%')
+              return {'status': 'started', 'commandId': r['Command']['CommandId'], 'instances': ids}
+
+  TriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qualys-ssm-trigger
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ScanStateMachine
+      Code:
+        ZipFile: |
+          import boto3, json, os
+          ec2 = boto3.client('ec2')
+          sfn = boto3.client('stepfunctions')
+          def handler(event, context):
+              ids = parse(event)
+              if not ids:
+                  return {'status': 'no_targets'}
+              sfn.start_execution(stateMachineArn=os.environ['STATE_MACHINE_ARN'], input=json.dumps({'instance_ids': ids}))
+              return {'status': 'started', 'instances': ids}
+          def parse(event):
+              if event.get('detail-type') == 'EC2 Instance State-change Notification':
+                  if event['detail']['state'] == 'running':
+                      iid = event['detail']['instance-id']
+                      if not is_disabled(iid):
+                          return [iid]
+                  return []
+              if event.get('detail-type') == 'Scheduled Event':
+                  return get_tagged()
+              if 'instance_ids' in event:
+                  return event['instance_ids']
+              if event.get('scan_type') == 'fleet':
+                  return get_tagged()
+              return []
+          def is_disabled(iid):
+              try:
+                  r = ec2.describe_instances(InstanceIds=[iid])
+                  for res in r['Reservations']:
+                      for i in res['Instances']:
+                          tags = {t['Key']: t['Value'] for t in i.get('Tags', [])}
+                          if tags.get('QualysScan', '').lower() == 'disabled':
+                              return True
+                  return False
+              except:
+                  return False
+          def get_tagged():
+              try:
+                  r = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}, {'Name': 'tag:QualysScan', 'Values': ['enabled', 'true']}])
+                  return [i['InstanceId'] for res in r['Reservations'] for i in res['Instances']]
+              except:
+                  return []
+
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CheckSSMLambda.Arn
+                  - !GetAtt SendCommandLambda.Arn
+
+  ScanStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: qualys-ssm-scan
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      Definition:
+        StartAt: CheckSSM
+        States:
+          CheckSSM:
+            Type: Task
+            Resource: !GetAtt CheckSSMLambda.Arn
+            Next: HasReadyInstances
+          HasReadyInstances:
+            Type: Choice
+            Choices:
+              - Variable: $.ready[0]
+                IsPresent: true
+                Next: SendCommand
+            Default: WaitForSSM
+          WaitForSSM:
+            Type: Wait
+            Seconds: 15
+            Next: CheckRetry
+          CheckRetry:
+            Type: Choice
+            Choices:
+              - Variable: $.retry_count
+                NumericLessThan: 4
+                Next: IncrementRetry
+            Default: NoInstancesReady
+          IncrementRetry:
+            Type: Pass
+            Parameters:
+              instance_ids.$: $.not_ready
+              retry_count.$: States.MathAdd($.retry_count, 1)
+            Next: CheckSSM
+          NoInstancesReady:
+            Type: Fail
+            Error: NoSSMInstances
+            Cause: No instances with SSM agent ready
+          SendCommand:
+            Type: Task
+            Resource: !GetAtt SendCommandLambda.Arn
+            End: true
+
+  NewEC2Rule:
+    Type: AWS::Events::Rule
+    Condition: CreateNewEC2Trigger
+    Properties:
+      Name: qualys-ssm-new-ec2
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Instance State-change Notification]
+        detail:
+          state: [running]
+      Targets:
+        - Id: Lambda
+          Arn: !GetAtt TriggerLambda.Arn
+
+  NewEC2Permission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateNewEC2Trigger
+    Properties:
+      FunctionName: !Ref TriggerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NewEC2Rule.Arn
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Condition: CreateScheduledTrigger
+    Properties:
+      Name: qualys-ssm-scheduled
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Id: Lambda
+          Arn: !GetAtt TriggerLambda.Arn
+
+  ScheduledPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateScheduledTrigger
+    Properties:
+      FunctionName: !Ref TriggerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: qualys-ssm-ec2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: QualysAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${HubBucketName}/qscanner/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${HubBucketName}/scans/*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref HubSecretArn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: qualys-ssm-ec2
+      Roles: [!Ref EC2Role]
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref ScanStateMachine
+
+  TriggerLambdaArn:
+    Value: !GetAtt TriggerLambda.Arn
+
+  EC2InstanceProfile:
+    Value: !Ref EC2InstanceProfile

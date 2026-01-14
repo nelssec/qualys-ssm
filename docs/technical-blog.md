@@ -1,338 +1,660 @@
-# Automated EC2 Vulnerability Scanning with Qualys QScanner and AWS Systems Manager
+# Multi-Cloud VM Vulnerability Scanning with Qualys QScanner
 
-## Introduction
+## The Problem
 
-Traditional agent-based vulnerability scanning requires deploying and maintaining scanning agents on every EC2 instance. This approach has challenges:
+Your security team needs vulnerability data across all cloud VMs. Traditional approaches require:
 
-- **Agent sprawl** - Another agent to install, update, and manage
-- **Resource overhead** - Continuous agent processes consuming CPU/memory
-- **Deployment friction** - Must bake agents into AMIs or install post-launch
-- **Coverage gaps** - Instances launched without agents go unscanned
+- Installing agents on every VM
+- Managing agent versions across AWS, Azure, and GCP
+- Hoping nothing falls through the cracks
 
-This solution takes a different approach: **agentless, on-demand scanning** using Qualys QScanner and AWS Systems Manager (SSM). Instead of persistent agents, we trigger scans via SSM Run Command when instances launch or on a schedule.
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AWS Account                                     │
-│                                                                             │
-│  ┌───────────────────┐                                                      │
-│  │   EventBridge     │                                                      │
-│  │  ┌─────────────┐  │     ┌──────────────┐     ┌─────────────────────┐   │
-│  │  │ New EC2     │──┼────►│   Lambda     │────►│  SSM Run Command    │   │
-│  │  │ Instance    │  │     │  (Trigger)   │     │                     │   │
-│  │  └─────────────┘  │     └──────────────┘     └──────────┬──────────┘   │
-│  │  ┌─────────────┐  │                                     │              │
-│  │  │ Scheduled   │──┼─────────────┘                       │              │
-│  │  │ (Daily)     │  │                                     ▼              │
-│  │  └─────────────┘  │                          ┌─────────────────────┐   │
-│  └───────────────────┘                          │   EC2 Instances     │   │
-│                                                 │  ┌─────┐  ┌─────┐   │   │
-│  ┌───────────────────┐                          │  │ i-1 │  │ i-2 │   │   │
-│  │ Secrets Manager   │◄─────────────────────────│  │     │  │     │   │   │
-│  │ (Qualys Token)    │                          │  │qscan│  │qscan│   │   │
-│  └───────────────────┘                          │  └──┬──┘  └──┬──┘   │   │
-│                                                 └─────┼────────┼──────┘   │
-│                                                       │        │          │
-│                                                       ▼        ▼          │
-│  ┌───────────────────┐     ┌───────────────────────────────────────────┐ │
-│  │ Qualys Dashboard  │◄────│              S3 Bucket                     │ │
-│  │ (Vuln Results)    │     │         (Scan Artifacts)                  │ │
-│  └───────────────────┘     └───────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**This solution**: Deploy once per cloud, scan automatically, get results in Qualys.
 
 ## How It Works
 
-### 1. Event-Driven Scanning
+```mermaid
+flowchart LR
+    subgraph Hub["Hub Account"]
+        S[("Scan Results")]
+        C[("Credentials")]
+    end
 
-When a new EC2 instance enters the `running` state, EventBridge captures the state change event and triggers our Lambda function:
+    subgraph Spoke["Spoke Accounts"]
+        E["Event Trigger"]
+        O["Orchestrator"]
+        VM["VM + QScanner"]
+    end
+
+    E -->|"VM Created"| O
+    O -->|"Run Scan"| VM
+    VM -->|"Get Token"| C
+    VM -->|"Upload Results"| S
+    S -->|"Vulnerabilities"| Q["Qualys Dashboard"]
+```
+
+## Cloud-Native Implementation
+
+Each cloud uses its native services - no third-party tools required.
+
+```mermaid
+flowchart TB
+    subgraph AWS
+        EB["EventBridge"] --> SF["Step Functions"]
+        SF --> SSM["SSM Run Command"]
+        SSM --> EC2["EC2"]
+    end
+
+    subgraph Azure
+        EG["Event Grid"] --> AF["Azure Functions"]
+        AF --> AA["Automation Account"]
+        AA --> AVM["VM"]
+    end
+
+    subgraph GCP
+        AL["Audit Logs"] --> PS["Pub/Sub"]
+        PS --> CF["Cloud Functions"]
+        CF --> GCE["Compute Engine"]
+    end
+```
+
+## What You Get
+
+QScanner performs three scan types in a single pass:
+
+```mermaid
+flowchart LR
+    QS["QScanner"] --> OS["OS Packages<br/>CVE-2024-1234..."]
+    QS --> SCA["Software Composition<br/>Log4j, OpenSSL..."]
+    QS --> FI["File Insights<br/>Configs, Permissions"]
+
+    OS --> R["Results"]
+    SCA --> R
+    FI --> R
+    R --> QD["Qualys Dashboard"]
+```
+
+| Scan Type | What It Finds | Example |
+|-----------|---------------|---------|
+| **OS** | Package vulnerabilities | CVE-2024-1234 in openssl-1.1.1 |
+| **SCA** | Library vulnerabilities | Log4Shell in log4j-2.14.0.jar |
+| **FileInsight** | Misconfigurations | World-readable /etc/shadow |
+
+## Deployment Flow
+
+### 1. Deploy Hub (Once)
+
+Central account stores credentials and collects results.
+
+```mermaid
+flowchart LR
+    subgraph Hub
+        SM["Secrets Manager<br/>Key Vault<br/>Secret Manager"]
+        S3["S3 / Blob Storage<br/>Cloud Storage"]
+    end
+
+    Admin["Security Admin"] -->|"Deploy Hub"| Hub
+    Admin -->|"Add Qualys Token"| SM
+```
+
+### 2. Deploy Spokes (Per Account)
+
+Lightweight deployment triggers scans and reports back.
+
+```mermaid
+flowchart LR
+    subgraph Spoke1["Account A"]
+        T1["Trigger"] --> V1["VMs"]
+    end
+
+    subgraph Spoke2["Account B"]
+        T2["Trigger"] --> V2["VMs"]
+    end
+
+    subgraph Spoke3["Account C"]
+        T3["Trigger"] --> V3["VMs"]
+    end
+
+    V1 --> Hub["Hub"]
+    V2 --> Hub
+    V3 --> Hub
+    Hub --> Qualys["Qualys"]
+```
+
+## Scan Triggers
+
+Two automatic triggers ensure coverage:
+
+```mermaid
+flowchart TB
+    subgraph Triggers
+        NEW["New VM Created"] -->|"Immediate"| SCAN["Scan"]
+        SCHED["Daily Schedule<br/>2 AM UTC"] -->|"Fleet Scan"| SCAN
+    end
+
+    SCAN --> RESULTS["Results in Qualys"]
+```
+
+---
+
+## End-to-End: AWS
+
+### Architecture Deep Dive
+
+```mermaid
+flowchart TB
+    subgraph EventBridge["Amazon EventBridge"]
+        EC2Event["EC2 State Change Rule"]
+        SchedEvent["Scheduled Rule<br/>cron(0 2 * * ? *)"]
+    end
+
+    subgraph Lambda["AWS Lambda"]
+        Trigger["qualys-ssm-trigger<br/>Python 3.11"]
+        Check["qualys-ssm-check<br/>Python 3.11"]
+        Send["qualys-ssm-send<br/>Python 3.11"]
+    end
+
+    subgraph StepFunctions["AWS Step Functions"]
+        SM["qualys-ssm-scan<br/>State Machine"]
+    end
+
+    subgraph SSM["AWS Systems Manager"]
+        Doc["SSM Document<br/>qualys-ssm-scan"]
+    end
+
+    subgraph EC2["Amazon EC2"]
+        Instance["Target Instance<br/>SSM Agent"]
+    end
+
+    subgraph Hub["Hub Account"]
+        Secrets["Secrets Manager<br/>qualys-ssm-scanner-credentials"]
+        S3["S3 Bucket<br/>qualys-ssm-hub-{AccountId}"]
+    end
+
+    EC2Event -->|"instance running"| Trigger
+    SchedEvent -->|"daily 2 AM"| Trigger
+    Trigger -->|"StartExecution"| SM
+    SM -->|"CheckSSM"| Check
+    Check -->|"DescribeInstanceInformation"| SSM
+    SM -->|"SendCommand"| Send
+    Send -->|"SendCommand"| Doc
+    Doc -->|"runShellScript"| Instance
+    Instance -->|"GetSecretValue"| Secrets
+    Instance -->|"PutObject"| S3
+```
+
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EC2 as EC2 Instance
+    participant EB as EventBridge
+    participant TL as Trigger Lambda
+    participant SF as Step Functions
+    participant CL as Check Lambda
+    participant SSM as SSM Agent
+    participant SL as Send Lambda
+    participant SM as Secrets Manager
+    participant S3 as S3 Bucket
+    participant Q as Qualys API
+
+    Note over EC2,EB: VM Launch Event
+    EC2->>EB: State = "running"
+    EB->>TL: EC2 State Change Event
+    TL->>TL: Parse instance ID
+    TL->>SF: StartExecution({instance_ids: [i-xxx]})
+
+    Note over SF,SSM: SSM Agent Readiness Check
+    SF->>CL: CheckSSM state
+    CL->>SSM: DescribeInstanceInformation
+    SSM-->>CL: PingStatus: "Online"
+    CL-->>SF: {ready: [i-xxx], not_ready: []}
+
+    Note over SF,SL: Execute Scan Command
+    SF->>SL: SendCommand state
+    SL->>SSM: SendCommand(DocumentName: qualys-ssm-scan)
+    SSM->>EC2: Execute runShellScript
+
+    Note over EC2,Q: Scan Execution
+    EC2->>EC2: Download QScanner binary
+    EC2->>EC2: Verify SHA256 checksum
+    EC2->>SM: GetSecretValue(qualys-ssm-scanner-credentials)
+    SM-->>EC2: {qualys_pod, qualys_access_token}
+    EC2->>EC2: Run: qscanner --scan-types os,sca,fileinsight rootfs /
+    EC2->>Q: Report vulnerabilities
+    EC2->>S3: Upload JSON + SARIF results
+    S3-->>EC2: 200 OK
+
+    Note over SF: Scan Complete
+    SSM-->>SL: CommandStatus: "Success"
+    SL-->>SF: {status: "started", commandId: "xxx"}
+```
+
+### Key AWS Resources
+
+| Resource | Type | Purpose |
+|----------|------|---------|
+| `qualys-ssm-trigger` | Lambda Function | Parses events, starts Step Function |
+| `qualys-ssm-check` | Lambda Function | Polls SSM agent readiness |
+| `qualys-ssm-send` | Lambda Function | Invokes SSM Run Command |
+| `qualys-ssm-scan` | Step Function | Orchestrates check → wait → send flow |
+| `qualys-ssm-scan` | SSM Document | Shell script for QScanner execution |
+| `qualys-ssm-new-ec2` | EventBridge Rule | Triggers on EC2 running state |
+| `qualys-ssm-scheduled` | EventBridge Rule | Daily fleet scan at 2 AM UTC |
+
+### SSM Document Execution
+
+The SSM Document runs this workflow on the EC2 instance:
+
+```mermaid
+flowchart TB
+    A["Start"] --> B["Get Instance Metadata<br/>IMDSv2 Token"]
+    B --> C["Detect Architecture<br/>x86_64 / arm64"]
+    C --> D{"QScanner<br/>Cached?"}
+    D -->|"No"| E["Download from GitHub"]
+    D -->|"Yes, > 30 days"| F["Check SHA256"]
+    F -->|"Changed"| E
+    F -->|"Same"| G["Use Cached"]
+    D -->|"Yes, < 30 days"| G
+    E --> H["Verify SHA256"]
+    H --> G
+    G --> I["Get Qualys Token<br/>from Secrets Manager"]
+    I --> J["Run QScanner<br/>--scan-types os,sca,fileinsight"]
+    J --> K["Upload Results to S3<br/>scans/{AccountId}/{InstanceId}/{Timestamp}/"]
+    K --> L["Cleanup temp files"]
+    L --> M["End"]
+```
+
+---
+
+## End-to-End: Azure
+
+### Architecture Deep Dive
+
+```mermaid
+flowchart TB
+    subgraph EventGrid["Azure Event Grid"]
+        Topic["System Topic<br/>Microsoft.Resources.Subscriptions"]
+        Sub["Event Subscription<br/>ResourceWriteSuccess filter"]
+    end
+
+    subgraph Functions["Azure Functions"]
+        Trigger["TriggerScan<br/>Python 3.11"]
+        Orchestrator["ScanOrchestrator<br/>Durable Function"]
+    end
+
+    subgraph Automation["Azure Automation"]
+        Account["Automation Account"]
+        Runbook["Invoke-QualysScan<br/>PowerShell Runbook"]
+    end
+
+    subgraph Compute["Azure Compute"]
+        VM["Target VM<br/>Run Command"]
+    end
+
+    subgraph Hub["Hub Resources"]
+        KeyVault["Key Vault<br/>qualys-hub-{suffix}"]
+        Storage["Storage Account<br/>qualysscan{suffix}"]
+    end
+
+    Topic -->|"VM created"| Sub
+    Sub -->|"HTTP trigger"| Trigger
+    Trigger -->|"Start orchestration"| Orchestrator
+    Orchestrator -->|"Start runbook"| Account
+    Account -->|"Invoke-AzVMRunCommand"| Runbook
+    Runbook -->|"Run Command"| VM
+    VM -->|"Get-AzKeyVaultSecret"| KeyVault
+    VM -->|"Upload blob"| Storage
+```
+
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VM as Azure VM
+    participant ARM as Azure Resource Manager
+    participant EG as Event Grid
+    participant AF as Azure Function
+    participant AA as Automation Account
+    participant RB as Runbook
+    participant KV as Key Vault
+    participant SA as Storage Account
+    participant Q as Qualys API
+
+    Note over VM,ARM: VM Creation Event
+    VM->>ARM: Create VM Request
+    ARM->>ARM: Provision VM
+    ARM->>EG: ResourceWriteSuccess Event
+
+    Note over EG,AF: Event Processing
+    EG->>AF: HTTP Trigger (VM Created)
+    AF->>AF: Validate VM (check tags)
+    AF->>AF: Extract resourceId, subscriptionId
+
+    Note over AF,RB: Scan Orchestration
+    AF->>AA: Start-AzAutomationRunbook
+    AA->>RB: Execute Invoke-QualysScan
+    RB->>RB: Get VM details from resourceId
+
+    Note over RB,VM: Run Command Execution
+    RB->>VM: Invoke-AzVMRunCommand -ScriptPath scan.sh
+
+    Note over VM,Q: Scan Execution
+    VM->>VM: Download QScanner binary
+    VM->>VM: Verify SHA256 checksum
+    VM->>KV: Get-AzKeyVaultSecret -Name qualys-access-token
+    KV-->>VM: SecretValue
+    VM->>KV: Get-AzKeyVaultSecret -Name qualys-pod
+    KV-->>VM: SecretValue
+    VM->>VM: Run: qscanner --scan-types os,sca,fileinsight rootfs /
+    VM->>Q: Report vulnerabilities
+    VM->>SA: Upload to scans/{subscriptionId}/{vmName}/{timestamp}/
+    SA-->>VM: 201 Created
+
+    Note over RB: Scan Complete
+    VM-->>RB: Exit Code 0
+    RB-->>AA: Runbook Completed
+    AA-->>AF: Job Status: Completed
+```
+
+### Key Azure Resources
+
+| Resource | Type | Purpose |
+|----------|------|---------|
+| `qualys-scan-{suffix}` | Function App | Serverless compute, Python 3.11 |
+| `TriggerScan` | Function | HTTP trigger from Event Grid |
+| `qualys-automation-{suffix}` | Automation Account | Hosts runbooks for VM execution |
+| `Invoke-QualysScan` | Runbook | PowerShell script invoking Run Command |
+| `qualys-vm-events-{suffix}` | Event Grid System Topic | Captures subscription-level events |
+| `new-vm-trigger` | Event Subscription | Filters for VM creation events |
+| `qualys-hub-{suffix}` | Key Vault | Stores Qualys credentials |
+| `qualysscan{suffix}` | Storage Account | Blob storage for scan results |
+
+### Event Grid Filter
+
+The Event Grid subscription filters for VM creation:
 
 ```json
 {
-  "source": ["aws.ec2"],
-  "detail-type": ["EC2 Instance State-change Notification"],
-  "detail": {
-    "state": ["running"]
-  }
+  "includedEventTypes": ["Microsoft.Resources.ResourceWriteSuccess"],
+  "advancedFilters": [
+    {
+      "key": "data.resourceProvider",
+      "operatorType": "StringEquals",
+      "values": ["Microsoft.Compute"]
+    },
+    {
+      "key": "data.operationName",
+      "operatorType": "StringContains",
+      "values": ["Microsoft.Compute/virtualMachines/write"]
+    }
+  ]
 }
 ```
 
-The Lambda function:
-1. Extracts the instance ID from the event
-2. Waits for the SSM agent to come online (configurable delay)
-3. Sends an SSM Run Command to execute the scan
+### Managed Identity Flow
 
-### 2. The QScanner rootfs Command
+```mermaid
+flowchart LR
+    subgraph Spoke["Spoke Subscription"]
+        FA["Function App<br/>System-Assigned Identity"]
+        AA["Automation Account<br/>System-Assigned Identity"]
+    end
 
-QScanner's `rootfs` command is the key to this solution. Unlike container image scanning, `rootfs` scans a live filesystem:
+    subgraph Hub["Hub Subscription"]
+        KV["Key Vault"]
+        SA["Storage Account"]
+    end
 
-```bash
-./qscanner --pod US2 \
-  --mode get-report \
-  --scan-types os,sca,fileinsight \
-  --shell-commands "uname -a=$(uname -a)" \
-  --exclude-dirs /proc,/sys,/dev,/run \
-  rootfs /
+    FA -->|"Key Vault Secrets User"| KV
+    FA -->|"Virtual Machine Contributor"| VM["Target VMs"]
+    AA -->|"Virtual Machine Contributor"| VM
+    AA -->|"Storage Blob Data Contributor"| SA
 ```
 
-**What gets scanned:**
+---
 
-| Scan Type | What It Finds |
-|-----------|---------------|
-| `os` | Operating system packages (rpm, dpkg, apk) and their CVEs |
-| `sca` | Software Composition Analysis - JARs, Node modules, Python packages, Go binaries |
-| `fileinsight` | File metadata, permissions, configuration analysis |
+## End-to-End: GCP
 
-### 3. SSM Document
+### Architecture Deep Dive
 
-The SSM Document defines the scan workflow:
+```mermaid
+flowchart TB
+    subgraph Logging["Cloud Logging"]
+        AuditLog["Audit Log<br/>compute.instances.insert"]
+        Sink["Log Sink<br/>qualys-new-vm-trigger"]
+    end
 
-```yaml
-mainSteps:
-  - action: aws:runShellScript
-    name: runQscanner
-    inputs:
-      runCommand:
-        - |
-          # Get Qualys credentials from Secrets Manager
-          SECRET_JSON=$(aws secretsmanager get-secret-value \
-            --secret-id "qualys/qscanner-token" \
-            --query 'SecretString' --output text)
-          export QUALYS_ACCESS_TOKEN=$(echo $SECRET_JSON | jq -r '.access_token')
+    subgraph Messaging["Cloud Pub/Sub"]
+        Topic["Topic<br/>qualys-scan-trigger"]
+        Subscription["Subscription<br/>qualys-scan-trigger-sub"]
+    end
 
-          # Run the scan
-          /opt/qualys/qscanner \
-            --pod {{ Pod }} \
-            --mode get-report \
-            --scan-types {{ ScanTypes }} \
-            --shell-commands "uname -a=$(uname -a)" \
-            rootfs /
+    subgraph Functions["Cloud Functions Gen2"]
+        Scanner["qualys-vm-scanner<br/>Python 3.11"]
+    end
 
-          # Upload results to S3
-          aws s3 cp /tmp/results/ s3://bucket/scans/${INSTANCE_ID}/ --recursive
+    subgraph Scheduler["Cloud Scheduler"]
+        Job["qualys-daily-scan<br/>cron: 0 2 * * *"]
+    end
+
+    subgraph Compute["Compute Engine"]
+        VM["Target VM<br/>Startup Script / OS Config"]
+    end
+
+    subgraph Hub["Hub Project"]
+        SecretMgr["Secret Manager<br/>qualys-ssm-scanner-credentials"]
+        GCS["Cloud Storage<br/>qualys-ssm-hub-{project}"]
+    end
+
+    AuditLog -->|"instances.insert"| Sink
+    Sink -->|"Publish"| Topic
+    Job -->|"Publish"| Topic
+    Topic --> Subscription
+    Subscription -->|"Push"| Scanner
+    Scanner -->|"gcloud compute ssh"| VM
+    VM -->|"Access secret"| SecretMgr
+    VM -->|"Upload objects"| GCS
 ```
 
-### 4. Results Flow
+### Sequence Diagram
 
-Scan results flow to two destinations:
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GCE as Compute Engine
+    participant AL as Audit Logs
+    participant LS as Log Sink
+    participant PS as Pub/Sub Topic
+    participant CF as Cloud Function
+    participant SM as Secret Manager
+    participant GCS as Cloud Storage
+    participant Q as Qualys API
 
-1. **Qualys Dashboard** - Full vulnerability report with CVE details, QDS scores, and remediation guidance
-2. **S3 Bucket** - JSON/SARIF artifacts for integration with other tools
+    Note over GCE,AL: VM Creation Event
+    GCE->>GCE: Create Instance
+    GCE->>AL: AuditLog: compute.instances.insert
+    AL->>LS: Match filter: methodName="v1.compute.instances.insert"
+    LS->>PS: Publish message
 
-## Deployment
+    Note over PS,CF: Event Processing
+    PS->>CF: Trigger (Pub/Sub push)
+    CF->>CF: Parse instance name, zone, project
+    CF->>CF: Check labels (qualys-scan != disabled)
 
-### Prerequisites
+    Note over CF,GCE: Scan Execution via Metadata
+    CF->>GCE: Set startup-script metadata
+    GCE->>GCE: Execute startup script on next boot
 
-1. AWS account with appropriate permissions
-2. Qualys subscription with Container Security module
-3. EC2 instances with SSM Agent installed (Amazon Linux 2/2023, Ubuntu 16.04+, etc. have it pre-installed)
+    Note over GCE,Q: Alternative: Direct SSH Execution
+    CF->>GCE: gcloud compute ssh --command="scan.sh"
 
-### Step 1: Get Your Qualys Token
+    Note over GCE,Q: Scan Execution
+    GCE->>GCE: Download QScanner binary
+    GCE->>GCE: Verify SHA256 checksum
+    GCE->>SM: gcloud secrets versions access latest --secret=qualys-ssm-scanner-credentials
+    SM-->>GCE: {"qualys_pod": "US2", "qualys_access_token": "xxx"}
+    GCE->>GCE: Run: qscanner --scan-types os,sca,fileinsight rootfs /
+    GCE->>Q: Report vulnerabilities
+    GCE->>GCS: gsutil cp results gs://qualys-ssm-hub-{project}/scans/{project}/{instance}/{timestamp}/
+    GCS-->>GCE: Upload complete
 
-Generate an access token from the Qualys platform:
-1. Log into Qualys
-2. Navigate to **Administration** → **API Tokens**
-3. Generate a new token with Container Security permissions
-
-### Step 2: Deploy the Stack
-
-```bash
-# Clone the repository
-git clone https://github.com/your-org/qualys-ssm.git
-cd qualys-ssm
-
-# Deploy (replace with your token)
-QUALYS_TOKEN=your-token-here make deploy
+    Note over CF: Scan Complete
+    GCE-->>CF: Exit Code 0
 ```
 
-### Step 3: Upload QScanner Binary
+### Key GCP Resources
 
-Download QScanner from Qualys and upload to the S3 bucket:
+| Resource | Type | Purpose |
+|----------|------|---------|
+| `qualys-vm-scanner` | Cloud Function Gen2 | Serverless compute, Python 3.11 |
+| `qualys-scan-trigger` | Pub/Sub Topic | Event messaging |
+| `qualys-scan-trigger-sub` | Pub/Sub Subscription | Delivers messages to function |
+| `qualys-new-vm-trigger` | Log Sink | Routes audit logs to Pub/Sub |
+| `qualys-daily-scan` | Cloud Scheduler Job | Daily fleet scan at 2 AM UTC |
+| `qualys-scanner` | Service Account | Cross-project access |
+| `qualys-ssm-scanner-credentials` | Secret Manager Secret | Stores Qualys credentials |
+| `qualys-ssm-hub-{project}` | Cloud Storage Bucket | Stores scan results |
 
-```bash
-# Download from Qualys portal, then:
-make upload-qscanner
+### Log Sink Filter
+
+The log sink captures VM creation events:
+
+```
+resource.type="gce_instance"
+protoPayload.methodName="v1.compute.instances.insert"
+protoPayload.response.status="RUNNING"
 ```
 
-### Step 4: Tag Instances for Scanning
+### Service Account Permissions
 
-For scheduled fleet scans, tag instances:
+```mermaid
+flowchart LR
+    subgraph Spoke["Spoke Project"]
+        SA["qualys-scanner<br/>Service Account"]
+    end
 
-```bash
-aws ec2 create-tags \
-  --resources i-0abc123 \
-  --tags Key=QualysScan,Value=enabled
+    subgraph Hub["Hub Project"]
+        SM["Secret Manager"]
+        GCS["Cloud Storage"]
+    end
+
+    subgraph Spoke2["Spoke Project"]
+        GCE["Compute Instances"]
+    end
+
+    SA -->|"roles/secretmanager.secretAccessor"| SM
+    SA -->|"roles/storage.objectCreator"| GCS
+    SA -->|"roles/compute.instanceAdmin.v1"| GCE
 ```
 
-## Scanning Options
-
-### On-Demand: Specific Instance
-
-```bash
-INSTANCE_ID=i-0abc123 make scan-instance
-```
-
-### On-Demand: All Tagged Instances
-
-```bash
-make scan-fleet
-```
-
-### Automatic: New Instances
-
-Enabled by default - any new EC2 instance is scanned when it starts.
-
-### Scheduled: Daily Fleet Scan
-
-Enabled by default - runs daily at 2 AM UTC. Customize the schedule:
-
-```yaml
-ScheduleExpression: 'cron(0 2 * * ? *)'  # Daily at 2 AM UTC
-```
-
-## Use Cases
-
-### 1. Golden AMI Validation
-
-Scan your base AMIs before deployment:
-
-```bash
-# Launch instance from AMI
-INSTANCE_ID=$(aws ec2 run-instances \
-  --image-id ami-xxxxx \
-  --instance-type t3.micro \
-  --query 'Instances[0].InstanceId' \
-  --output text)
-
-# Wait for scan to complete, check results
-make get-scan-results INSTANCE_ID=$INSTANCE_ID
-```
-
-### 2. Compliance Auditing
-
-Schedule weekly scans and export to your SIEM:
-
-```bash
-# Results are stored in S3 in SARIF format
-aws s3 sync s3://qualys-ssm-results-xxx/scans/ ./local-scans/
-# Import SARIF files into your security tooling
-```
-
-### 3. Incident Response
-
-Quickly scan a potentially compromised instance:
-
-```bash
-INSTANCE_ID=i-suspicious make scan-instance
-```
-
-### 4. CI/CD Pipeline Integration
-
-Trigger scans after deployment:
-
-```yaml
-# GitHub Actions example
-- name: Scan deployed instance
-  run: |
-    aws lambda invoke \
-      --function-name QualysSSMScanner-Trigger \
-      --payload '{"instance_ids":["${{ env.INSTANCE_ID }}"]}' \
-      response.json
-```
-
-## Advantages Over Agent-Based Scanning
-
-| Aspect | Agent-Based | SSM-Based (This Solution) |
-|--------|-------------|---------------------------|
-| **Installation** | Required on every instance | None - uses SSM agent (pre-installed) |
-| **Maintenance** | Agent updates needed | QScanner binary in S3, one location |
-| **Resource Usage** | Continuous | On-demand only |
-| **Coverage** | Only where agents installed | Any SSM-managed instance |
-| **Scan Control** | Agent schedules | Centralized Lambda control |
-| **Cost** | Agent licensing | Pay-per-scan (API calls) |
-
-## Security Considerations
-
-### Secrets Management
-
-Qualys credentials are stored in AWS Secrets Manager, never in code or environment variables:
+### Cloud Function Environment
 
 ```python
-SECRET_JSON=$(aws secretsmanager get-secret-value \
-  --secret-id "qualys/qscanner-token")
+# Environment variables set on Cloud Function
+HUB_PROJECT_ID   = "security-hub-project"
+HUB_BUCKET_NAME  = "qualys-ssm-hub-security-hub-project"
+HUB_SECRET_ID    = "qualys-ssm-scanner-credentials"
+SCAN_TYPES       = "os,sca,fileinsight"
+PROJECT_ID       = "workload-project-123"
 ```
 
-### IAM Least Privilege
+---
 
-EC2 instances only get permissions they need:
-- `secretsmanager:GetSecretValue` - Only for the Qualys secret
-- `s3:PutObject` - Only to the results bucket
-- SSM permissions via `AmazonSSMManagedInstanceCore`
+## Quick Start
 
-### Network Security
-
-QScanner communicates with:
-- Qualys API endpoints (outbound HTTPS)
-- S3 (can use VPC endpoint for private access)
-- Secrets Manager (can use VPC endpoint)
-
-## Troubleshooting
-
-### SSM Agent Not Ready
-
-If scans fail with "No SSM-ready instances":
-
+**AWS:**
 ```bash
-# Check SSM agent status
-make check-ssm-status
+# Set credentials
+export QUALYS_ACCESS_TOKEN="your-token"
 
-# Verify instance has SSM role attached
-aws ec2 describe-iam-instance-profile-associations \
-  --filters Name=instance-id,Values=i-xxxxx
+# Deploy hub (security account)
+make aws-deploy-hub ORG_ID=o-xxxxx
+
+# Deploy spokes (org-wide via StackSet)
+make aws-deploy-stackset-instances OU_IDS=ou-xxxxx
 ```
 
-### QScanner Binary Not Found
-
-Ensure the binary is uploaded to S3:
-
+**Azure:**
 ```bash
-# Upload the binary
-make upload-qscanner
+# Set credentials
+export QUALYS_ACCESS_TOKEN="your-token"
 
-# Verify it's there
-aws s3 ls s3://qualys-ssm-results-xxx/qscanner/
+# Deploy hub
+make azure-deploy-hub AZURE_RESOURCE_GROUP=qualys-hub-rg
+
+# Deploy spoke
+HUB_SUBSCRIPTION_ID=xxx \
+HUB_RESOURCE_GROUP=qualys-hub-rg \
+HUB_STORAGE_ACCOUNT=qualysscanxxx \
+HUB_KEY_VAULT=qualys-hub-xxx \
+make azure-deploy-spoke AZURE_RESOURCE_GROUP=qualys-spoke-rg
 ```
 
-### Scan Timeout
+**GCP:**
+```bash
+# Set credentials
+export QUALYS_ACCESS_TOKEN="your-token"
 
-For large instances with many packages, increase the timeout in the SSM document:
+# Deploy hub
+make gcp-deploy-hub GCP_PROJECT=security-hub-project
 
-```yaml
-timeoutSeconds: '1800'  # 30 minutes
+# Deploy spoke
+HUB_PROJECT_ID=security-hub-project \
+HUB_BUCKET_NAME=qualys-ssm-hub-security-hub-project \
+HUB_SECRET_ID=qualys-ssm-scanner-credentials \
+make gcp-deploy-spoke GCP_PROJECT=workload-project
 ```
 
-## Cost Optimization
+## Results in Qualys
 
-- **SSM Run Command** - Free for on-demand use
-- **Lambda** - Minimal cost (~$0.20/million invocations)
-- **S3** - Results lifecycle policy auto-deletes after 90 days
-- **Secrets Manager** - ~$0.40/month per secret
+Within minutes of VM launch, you'll see:
 
-## Conclusion
+- **Asset inventory** with cloud metadata (instance ID, region, account/subscription/project)
+- **Vulnerability findings** mapped to CVEs with severity scores
+- **Software inventory** including transitive dependencies
+- **Compliance data** from file and configuration analysis
 
-This SSM-based approach provides comprehensive vulnerability scanning without the overhead of traditional agents. By leveraging QScanner's `rootfs` capability and AWS Systems Manager, you get:
+## Why This Approach
 
-- **Immediate coverage** for new instances
-- **Centralized control** over scan scheduling and targeting
-- **No agent maintenance** burden
-- **Full visibility** into OS and application-level vulnerabilities
+| Traditional Agent | This Solution |
+|-------------------|---------------|
+| Install on every VM | Deploy once per account |
+| Always running | On-demand only |
+| Update agents everywhere | Update hub only |
+| Miss VMs without agent | Event-driven, automatic |
+| Different per cloud | Same pattern everywhere |
 
-The solution scales from a single instance to thousands, with EventBridge and SSM handling the orchestration automatically.
+## Security Model
 
-## Resources
+```mermaid
+flowchart TB
+    subgraph Hub["Hub (Trusted)"]
+        CREDS["Credentials<br/>Read-only from spokes"]
+        RESULTS["Results<br/>Write-only from spokes"]
+    end
 
-- [QScanner Documentation](https://www.qualys.com/docs/qscanner/)
-- [AWS Systems Manager Run Command](https://docs.aws.amazon.com/systems-manager/latest/userguide/execute-remote-commands.html)
-- [EventBridge EC2 Events](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-instance-state-changes.html)
+    subgraph Spoke["Spoke (Minimal)"]
+        SCAN["Scanner<br/>No stored credentials"]
+    end
+
+    Spoke -->|"Get token"| CREDS
+    Spoke -->|"Upload scan"| RESULTS
+```
+
+- Credentials never stored in spoke accounts
+- Spokes have minimal permissions (read creds, write results)
+- All storage encrypted at rest
+- TLS enforced on all API calls
+- No persistent processes on VMs
+- QScanner binary verified via SHA256 checksum
+
+## Get Started
+
+1. Clone the repo
+2. Set `QUALYS_ACCESS_TOKEN`
+3. Deploy hub + spokes
+4. VMs scanned automatically
+
+Questions? Open an issue.

@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Qualys SSM Scanner - Hub Account (Central Resources)
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (o-xxxxxxxxxx)
+
+  SecretArn:
+    Type: String
+    Description: ARN of the Qualys credentials secret
+
+Resources:
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub qualys-ssm-hub-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResults
+            Status: Enabled
+            ExpirationInDays: 90
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecure
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ResultsBucket.Arn
+              - !Sub ${ResultsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowOrgAccess
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub ${ResultsBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+
+  SecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref SecretArn
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOrgRead
+            Effect: Allow
+            Principal: '*'
+            Action: secretsmanager:GetSecretValue
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+
+Outputs:
+  ResultsBucketName:
+    Value: !Ref ResultsBucket
+    Export:
+      Name: qualys-ssm-hub-bucket
+
+  ResultsBucketArn:
+    Value: !GetAtt ResultsBucket.Arn
+    Export:
+      Name: qualys-ssm-hub-bucket-arn
+
+  SecretArn:
+    Value: !Ref SecretArn
+    Export:
+      Name: qualys-ssm-hub-secret-arn
+
+  HubAccountId:
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: qualys-ssm-hub-account-id
