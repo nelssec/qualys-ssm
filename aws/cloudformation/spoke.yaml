@@ -32,11 +32,24 @@ Parameters:
     Type: String
     Default: cron(0 2 * * ? *)
 
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 10
+    Description: Reserved concurrent executions for Lambda functions
+
 Conditions:
   CreateNewEC2Trigger: !Equals [!Ref EnableNewEC2Trigger, 'true']
   CreateScheduledTrigger: !Equals [!Ref EnableScheduledScan, 'true']
 
 Resources:
+  # Dead Letter Queue for Lambda failures
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qualys-ssm-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
   SSMDocument:
     Type: AWS::SSM::Document
     Properties:
@@ -156,24 +169,44 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: [ssm:SendCommand, ssm:DescribeInstanceInformation, ssm:GetCommandInvocation]
+              - Sid: SSMReadAccess
+                Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:GetCommandInvocation
                 Resource: '*'
-              - Effect: Allow
-                Action: [ec2:DescribeInstances, ec2:DescribeTags]
+              - Sid: SSMSendCommand
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/qualys-ssm-scan
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - Sid: EC2ReadAccess
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
                 Resource: '*'
-              - Effect: Allow
+              - Sid: StepFunctionsAccess
+                Effect: Allow
                 Action: states:StartExecution
                 Resource: !Ref ScanStateMachine
+              - Sid: DLQAccess
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
 
   CheckSSMLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: qualys-ssm-check
-      Runtime: python3.11
+      Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 30
+      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
       Code:
         ZipFile: |
           import boto3
@@ -181,23 +214,26 @@ Resources:
           def handler(event, context):
               ids = event.get('instance_ids', [])
               if not ids:
-                  return {'ready': [], 'not_ready': ids}
+                  return {'ready': [], 'not_ready': ids, 'retry_count': event.get('retry_count', 0)}
               try:
                   r = ssm.describe_instance_information(Filters=[{'Key': 'InstanceIds', 'Values': ids[:50]}])
                   ready = [i['InstanceId'] for i in r['InstanceInformationList'] if i['PingStatus'] == 'Online']
                   not_ready = [i for i in ids if i not in ready]
-                  return {'ready': ready, 'not_ready': not_ready}
-              except:
-                  return {'ready': [], 'not_ready': ids}
+                  return {'ready': ready, 'not_ready': not_ready, 'retry_count': event.get('retry_count', 0)}
+              except Exception:
+                  return {'ready': [], 'not_ready': ids, 'retry_count': event.get('retry_count', 0)}
 
   SendCommandLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: qualys-ssm-send
-      Runtime: python3.11
+      Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 30
+      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
       Environment:
         Variables:
           SSM_DOCUMENT: !Ref SSMDocument
@@ -217,10 +253,13 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: qualys-ssm-trigger
-      Runtime: python3.11
+      Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 30
+      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
       Environment:
         Variables:
           STATE_MACHINE_ARN: !Ref ScanStateMachine
@@ -233,7 +272,7 @@ Resources:
               ids = parse(event)
               if not ids:
                   return {'status': 'no_targets'}
-              sfn.start_execution(stateMachineArn=os.environ['STATE_MACHINE_ARN'], input=json.dumps({'instance_ids': ids}))
+              sfn.start_execution(stateMachineArn=os.environ['STATE_MACHINE_ARN'], input=json.dumps({'instance_ids': ids, 'retry_count': 0}))
               return {'status': 'started', 'instances': ids}
           def parse(event):
               if event.get('detail-type') == 'EC2 Instance State-change Notification':
@@ -258,13 +297,13 @@ Resources:
                           if tags.get('QualysScan', '').lower() == 'disabled':
                               return True
                   return False
-              except:
+              except Exception:
                   return False
           def get_tagged():
               try:
                   r = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}, {'Name': 'tag:QualysScan', 'Values': ['enabled', 'true']}])
                   return [i['InstanceId'] for res in r['Reservations'] for i in res['Instances']]
-              except:
+              except Exception:
                   return []
 
   StepFunctionRole:
@@ -393,13 +432,16 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
+              - Sid: S3GetQscanner
+                Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub arn:aws:s3:::${HubBucketName}/qscanner/*
-              - Effect: Allow
+              - Sid: S3PutResults
+                Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub arn:aws:s3:::${HubBucketName}/scans/*
-              - Effect: Allow
+              - Sid: SecretsAccess
+                Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref HubSecretArn
 
@@ -418,3 +460,6 @@ Outputs:
 
   EC2InstanceProfile:
     Value: !Ref EC2InstanceProfile
+
+  DLQArn:
+    Value: !GetAtt LambdaDLQ.Arn

@@ -75,6 +75,7 @@ resource "google_project_service" "apis" {
     "secretmanager.googleapis.com",
     "compute.googleapis.com",
     "logging.googleapis.com",
+    "run.googleapis.com",
   ])
   project = var.project_id
   service = each.value
@@ -109,10 +110,12 @@ resource "google_project_iam_member" "scanner_compute_admin" {
   member  = "serviceAccount:${google_service_account.scanner.email}"
 }
 
-# Pub/Sub topic for scan triggers
+# Pub/Sub topic for scan triggers with CMEK (using Google-managed key)
 resource "google_pubsub_topic" "scan_trigger" {
   project = var.project_id
   name    = "qualys-scan-trigger"
+
+  message_retention_duration = "86400s"
 }
 
 # Pub/Sub subscription for the function
@@ -121,25 +124,44 @@ resource "google_pubsub_subscription" "scan_trigger" {
   name    = "qualys-scan-trigger-sub"
   topic   = google_pubsub_topic.scan_trigger.name
 
-  ack_deadline_seconds = 600
+  ack_deadline_seconds       = 600
+  message_retention_duration = "86400s"
 
   retry_policy {
     minimum_backoff = "10s"
     maximum_backoff = "600s"
   }
+
+  expiration_policy {
+    ttl = ""
+  }
 }
 
-# Cloud Storage bucket for function source
+# Cloud Storage bucket for function source with security settings
 resource "google_storage_bucket" "function_source" {
   project                     = var.project_id
   name                        = "qualys-scanner-source-${var.project_id}"
   location                    = var.region
   uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
   force_destroy               = true
+
+  versioning {
+    enabled = true
+  }
 
   lifecycle_rule {
     condition {
       age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 3
     }
     action {
       type = "Delete"
@@ -154,22 +176,24 @@ resource "google_cloudfunctions2_function" "scanner" {
   location = var.region
 
   build_config {
-    runtime     = "python311"
+    runtime     = "python312"
     entry_point = "trigger_scan"
     source {
       storage_source {
         bucket = google_storage_bucket.function_source.name
-        object = "function-source.zip" # Placeholder - actual source deployed separately
+        object = "function-source.zip"
       }
     }
   }
 
   service_config {
-    max_instance_count    = 10
-    min_instance_count    = 0
-    available_memory      = "256M"
-    timeout_seconds       = 540
-    service_account_email = google_service_account.scanner.email
+    max_instance_count               = 10
+    min_instance_count               = 0
+    available_memory                 = "256M"
+    timeout_seconds                  = 540
+    service_account_email            = google_service_account.scanner.email
+    ingress_settings                 = "ALLOW_INTERNAL_AND_GCLB"
+    all_traffic_on_latest_revision   = true
 
     environment_variables = {
       HUB_PROJECT_ID  = var.hub_project_id

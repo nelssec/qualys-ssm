@@ -40,12 +40,14 @@ resource functionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
   location: location
   sku: {
-    name: 'Standard_LRS'
+    name: 'Standard_GRS'
   }
   kind: 'StorageV2'
   properties: {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
+    allowBlobPublicAccess: false
+    publicNetworkAccess: 'Enabled'
   }
 }
 
@@ -82,7 +84,7 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
   properties: {
     serverFarmId: hostingPlan.id
     siteConfig: {
-      pythonVersion: '3.11'
+      pythonVersion: '3.12'
       appSettings: [
         {
           name: 'AzureWebJobsStorage'
@@ -158,7 +160,7 @@ resource scanRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11-0
     logVerbose: false
     description: 'Executes Qualys QScanner on target VMs via Run Command'
     publishContentLink: {
-      uri: 'about:blank' // Placeholder - actual script embedded below
+      uri: 'about:blank'
     }
   }
 }
@@ -223,20 +225,17 @@ resource scanSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-11
 resource functionVmContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, functionApp.id, 'vm-contributor')
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '9980e02c-c2be-4d73-94e8-173b1dc7cf3c') // Virtual Machine Contributor
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '9980e02c-c2be-4d73-94e8-173b1dc7cf3c')
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-// Role assignment: Function App needs Key Vault Secrets User for hub Key Vault
-// Note: This needs to be applied at the hub subscription level separately
-
 // Role assignment: Automation Account needs VM Contributor
 resource automationVmContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, automationAccount.id, 'vm-contributor')
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '9980e02c-c2be-4d73-94e8-173b1dc7cf3c') // Virtual Machine Contributor
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '9980e02c-c2be-4d73-94e8-173b1dc7cf3c')
     principalId: automationAccount.identity.principalId
     principalType: 'ServicePrincipal'
   }

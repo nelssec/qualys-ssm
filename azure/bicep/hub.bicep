@@ -12,22 +12,23 @@ param qualysPod string = 'US2'
 @description('Qualys API access token')
 param qualysAccessToken string
 
-@description('Tenant IDs allowed to access hub resources (for cross-subscription access)')
-param allowedTenantIds array = [subscription().tenantId]
-
 @description('Result retention in days')
 param resultRetentionDays int = 90
+
+@description('Secret expiration in days from now')
+param secretExpirationDays int = 365
 
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var storageAccountName = 'qualysscan${uniqueSuffix}'
 var keyVaultName = 'qualys-hub-${uniqueSuffix}'
+var secretExpiration = dateTimeAdd(utcNow(), 'P${secretExpirationDays}D')
 
 // Storage Account for scan results
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: storageAccountName
   location: location
   sku: {
-    name: 'Standard_LRS'
+    name: 'Standard_GRS'
   }
   kind: 'StorageV2'
   properties: {
@@ -35,6 +36,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
     allowBlobPublicAccess: false
+    publicNetworkAccess: 'Enabled'
     networkAcls: {
       defaultAction: 'Allow'
       bypass: 'AzureServices'
@@ -42,7 +44,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   }
 }
 
-// Blob service with lifecycle management
+// Blob service with logging and lifecycle management
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-01-01' = {
   parent: storageAccount
   name: 'default'
@@ -52,6 +54,13 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-01-01'
       days: 7
     }
   }
+}
+
+// Queue service for logging
+resource queueService 'Microsoft.Storage/storageAccounts/queueServices@2023-01-01' = {
+  parent: storageAccount
+  name: 'default'
+  properties: {}
 }
 
 // Container for scan results
@@ -105,7 +114,8 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     tenantId: subscription().tenantId
     enableRbacAuthorization: true
     enableSoftDelete: true
-    softDeleteRetentionInDays: 7
+    enablePurgeProtection: true
+    softDeleteRetentionInDays: 90
     networkAcls: {
       defaultAction: 'Allow'
       bypass: 'AzureServices'
@@ -113,12 +123,17 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-// Store Qualys credentials as secrets
+// Store Qualys credentials as secrets with expiration and content type
 resource qualysPodSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: keyVault
   name: 'qualys-pod'
   properties: {
     value: qualysPod
+    contentType: 'text/plain'
+    attributes: {
+      enabled: true
+      exp: dateTimeToEpoch(secretExpiration)
+    }
   }
 }
 
@@ -127,6 +142,11 @@ resource qualysTokenSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   name: 'qualys-access-token'
   properties: {
     value: qualysAccessToken
+    contentType: 'application/json'
+    attributes: {
+      enabled: true
+      exp: dateTimeToEpoch(secretExpiration)
+    }
   }
 }
 

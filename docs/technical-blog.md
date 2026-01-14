@@ -148,9 +148,9 @@ flowchart TB
     end
 
     subgraph Lambda["AWS Lambda"]
-        Trigger["qualys-ssm-trigger<br/>Python 3.11"]
-        Check["qualys-ssm-check<br/>Python 3.11"]
-        Send["qualys-ssm-send<br/>Python 3.11"]
+        Trigger["qualys-ssm-trigger<br/>Python 3.12"]
+        Check["qualys-ssm-check<br/>Python 3.12"]
+        Send["qualys-ssm-send<br/>Python 3.12"]
     end
 
     subgraph StepFunctions["AWS Step Functions"]
@@ -279,7 +279,7 @@ flowchart TB
     end
 
     subgraph Functions["Azure Functions"]
-        Trigger["TriggerScan<br/>Python 3.11"]
+        Trigger["TriggerScan<br/>Python 3.12"]
         Orchestrator["ScanOrchestrator<br/>Durable Function"]
     end
 
@@ -362,7 +362,7 @@ sequenceDiagram
 
 | Resource | Type | Purpose |
 |----------|------|---------|
-| `qualys-scan-{suffix}` | Function App | Serverless compute, Python 3.11 |
+| `qualys-scan-{suffix}` | Function App | Serverless compute, Python 3.12 |
 | `TriggerScan` | Function | HTTP trigger from Event Grid |
 | `qualys-automation-{suffix}` | Automation Account | Hosts runbooks for VM execution |
 | `Invoke-QualysScan` | Runbook | PowerShell script invoking Run Command |
@@ -432,7 +432,7 @@ flowchart TB
     end
 
     subgraph Functions["Cloud Functions Gen2"]
-        Scanner["qualys-vm-scanner<br/>Python 3.11"]
+        Scanner["qualys-vm-scanner<br/>Python 3.12"]
     end
 
     subgraph Scheduler["Cloud Scheduler"]
@@ -508,7 +508,7 @@ sequenceDiagram
 
 | Resource | Type | Purpose |
 |----------|------|---------|
-| `qualys-vm-scanner` | Cloud Function Gen2 | Serverless compute, Python 3.11 |
+| `qualys-vm-scanner` | Cloud Function Gen2 | Serverless compute, Python 3.12 |
 | `qualys-scan-trigger` | Pub/Sub Topic | Event messaging |
 | `qualys-scan-trigger-sub` | Pub/Sub Subscription | Delivers messages to function |
 | `qualys-new-vm-trigger` | Log Sink | Routes audit logs to Pub/Sub |

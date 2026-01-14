@@ -57,7 +57,27 @@ variable "result_retention_days" {
 }
 
 locals {
-  bucket_name = "qualys-ssm-hub-${var.project_id}"
+  bucket_name     = "qualys-ssm-hub-${var.project_id}"
+  log_bucket_name = "qualys-ssm-logs-${var.project_id}"
+}
+
+# Cloud Storage bucket for access logs
+resource "google_storage_bucket" "logs" {
+  name                        = local.log_bucket_name
+  project                     = var.project_id
+  location                    = var.region
+  force_destroy               = true
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
 }
 
 # Cloud Storage bucket for scan results
@@ -67,14 +87,28 @@ resource "google_storage_bucket" "results" {
   location                    = var.region
   force_destroy               = false
   uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
 
   versioning {
-    enabled = false
+    enabled = true
+  }
+
+  logging {
+    log_bucket = google_storage_bucket.logs.name
   }
 
   lifecycle_rule {
     condition {
       age = var.result_retention_days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 3
     }
     action {
       type = "Delete"
@@ -111,7 +145,7 @@ resource "google_storage_bucket_iam_member" "spoke_access" {
   count  = var.allowed_org_id != "" ? 1 : 0
   bucket = google_storage_bucket.results.name
   role   = "roles/storage.objectCreator"
-  member = "domain:${var.allowed_org_id}" # Adjust based on your org structure
+  member = "domain:${var.allowed_org_id}"
 }
 
 # Outputs for spoke deployment
@@ -123,6 +157,11 @@ output "bucket_name" {
 output "bucket_url" {
   description = "URL of the results storage bucket"
   value       = google_storage_bucket.results.url
+}
+
+output "log_bucket_name" {
+  description = "Name of the access logs bucket"
+  value       = google_storage_bucket.logs.name
 }
 
 output "secret_name" {
