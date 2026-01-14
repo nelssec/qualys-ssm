@@ -58,8 +58,131 @@ variable "schedule_expression" {
   default     = "0 2 * * *"
 }
 
+variable "target_zones" {
+  description = "Zones to target for OS Config policy (e.g., us-central1-a,us-central1-b)"
+  type        = list(string)
+  default     = []
+}
+
 locals {
   function_name = "qualys-vm-scanner"
+  scanner_script = <<-EOT
+#!/bin/bash
+set -e
+
+QSCANNER="/opt/qualys/qscanner"
+TRIGGER_FILE="/tmp/qualys-scan-trigger"
+LOCK_FILE="/tmp/qualys-scan.lock"
+
+if [ -f "$LOCK_FILE" ]; then
+  LOCK_AGE=$(( ($(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)) ))
+  if [ "$LOCK_AGE" -lt 900 ]; then
+    echo "Scan already in progress"
+    exit 0
+  fi
+  rm -f "$LOCK_FILE"
+fi
+
+SCAN_REQUESTED=$(curl -s -f -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/qualys-scan-trigger" 2>/dev/null || echo "")
+
+if [ -z "$SCAN_REQUESTED" ] || [ "$SCAN_REQUESTED" = "false" ]; then
+  exit 0
+fi
+
+touch "$LOCK_FILE"
+trap "rm -f $LOCK_FILE" EXIT
+
+mkdir -p /opt/qualys
+
+INSTANCE_NAME=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/name")
+ZONE=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/zone" | cut -d'/' -f4)
+PROJECT_ID=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/project/project-id")
+MACHINE_TYPE=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/machine-type" | cut -d'/' -f4)
+
+ARCH=$(uname -m)
+case $ARCH in
+  x86_64) PLATFORM="linux-amd64" ;;
+  aarch64|arm64) PLATFORM="linux-arm64" ;;
+  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+case $PLATFORM in
+  linux-amd64) QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner.gz" ;;
+  linux-arm64) QSCANNER_URL="https://github.com/nelssec/qualys-lambda/raw/main/scanner-lambda/qscanner-arm64.gz" ;;
+esac
+
+QSCANNER_SHA="/opt/qualys/qscanner.sha256"
+REFRESH_DAYS=30
+NEED_DOWNLOAD=false
+
+if [ ! -f "$QSCANNER" ]; then
+  NEED_DOWNLOAD=true
+else
+  FILE_AGE=$(( ($(date +%s) - $(stat -c %Y "$QSCANNER")) / 86400 ))
+  if [ "$FILE_AGE" -gt "$REFRESH_DAYS" ]; then
+    LOCAL_SHA=$(cat "$QSCANNER_SHA" 2>/dev/null || echo "")
+    REMOTE_SHA=$(curl -sL "$${QSCANNER_URL}.sha256" 2>/dev/null || echo "")
+    if [ -n "$LOCAL_SHA" ] && [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+      touch "$QSCANNER"
+    else
+      NEED_DOWNLOAD=true
+    fi
+  fi
+fi
+
+if [ "$NEED_DOWNLOAD" = "true" ]; then
+  curl -sL "$QSCANNER_URL" -o /tmp/qscanner.gz
+  sha256sum /tmp/qscanner.gz | awk '{print $1}' > "$QSCANNER_SHA"
+  gunzip -c /tmp/qscanner.gz > $QSCANNER
+  chmod +x $QSCANNER
+  rm -f /tmp/qscanner.gz
+fi
+
+HUB_PROJECT="${hub_project_id}"
+HUB_SECRET="${hub_secret_id}"
+HUB_BUCKET="${hub_bucket_name}"
+SCAN_TYPES="${scan_types}"
+
+ACCESS_TOKEN=$(gcloud auth print-access-token 2>/dev/null || curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | \
+  grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+
+SECRET_JSON=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "https://secretmanager.googleapis.com/v1/projects/$HUB_PROJECT/secrets/$HUB_SECRET/versions/latest:access" | \
+  grep -o '"data":"[^"]*"' | cut -d'"' -f4 | base64 -d)
+
+export QUALYS_ACCESS_TOKEN=$(echo $SECRET_JSON | grep -o '"qualys_access_token":"[^"]*"' | cut -d'"' -f4)
+POD=$(echo $SECRET_JSON | grep -o '"qualys_pod":"[^"]*"' | cut -d'"' -f4)
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+OUTPUT="/tmp/qscanner-$${INSTANCE_NAME}-$${TIMESTAMP}"
+mkdir -p $OUTPUT
+
+$QSCANNER \
+  --pod $POD \
+  --mode get-report \
+  --scan-types $SCAN_TYPES \
+  --shell-commands "uname -a=$(uname -a)" \
+  --exclude-dirs /proc,/sys,/dev,/run,/tmp,/var/lib/docker \
+  --scan-target-info "instance_name=$${INSTANCE_NAME}" \
+  --scan-target-info "project_id=$${PROJECT_ID}" \
+  --scan-target-info "zone=$${ZONE}" \
+  --scan-target-info "machine_type=$${MACHINE_TYPE}" \
+  --report-format json,sarif \
+  -o $OUTPUT \
+  rootfs /
+
+gsutil -m cp -r "$OUTPUT/*" "gs://$HUB_BUCKET/scans/$PROJECT_ID/$INSTANCE_NAME/$TIMESTAMP/"
+
+rm -rf $OUTPUT
+
+gcloud compute instances remove-metadata "$INSTANCE_NAME" --zone="$ZONE" --keys=qualys-scan-trigger 2>/dev/null || true
+EOT
 }
 
 resource "google_project_service" "apis" {
@@ -72,6 +195,7 @@ resource "google_project_service" "apis" {
     "compute.googleapis.com",
     "logging.googleapis.com",
     "run.googleapis.com",
+    "osconfig.googleapis.com",
   ])
   project = var.project_id
   service = each.value
@@ -99,6 +223,12 @@ resource "google_storage_bucket_iam_member" "scanner_bucket_access" {
 resource "google_project_iam_member" "scanner_compute_admin" {
   project = var.project_id
   role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${google_service_account.scanner.email}"
+}
+
+resource "google_project_iam_member" "scanner_osconfig_admin" {
+  project = var.project_id
+  role    = "roles/osconfig.osPolicyAssignmentAdmin"
   member  = "serviceAccount:${google_service_account.scanner.email}"
 }
 
@@ -156,6 +286,53 @@ resource "google_storage_bucket" "function_source" {
       type = "Delete"
     }
   }
+}
+
+resource "google_os_config_os_policy_assignment" "qualys_scanner" {
+  name     = "qualys-scanner-policy"
+  project  = var.project_id
+  location = var.region
+
+  instance_filter {
+    all = false
+    inclusion_labels {
+      labels = {
+        "qualys-scan" = "enabled"
+      }
+    }
+  }
+
+  rollout {
+    disruption_budget {
+      fixed = 10
+    }
+    min_wait_duration = "60s"
+  }
+
+  os_policies {
+    id   = "qualys-scanner"
+    mode = "ENFORCEMENT"
+
+    resource_groups {
+      resources {
+        id = "run-qualys-scan"
+        exec {
+          validate {
+            interpreter = "SHELL"
+            script      = "exit 0"
+          }
+          enforce {
+            interpreter = "SHELL"
+            script      = local.scanner_script
+          }
+        }
+      }
+    }
+
+    allow_no_resource_group_match = true
+  }
+
+  depends_on = [google_project_service.apis]
 }
 
 resource "google_cloudfunctions2_function" "scanner" {
@@ -263,4 +440,9 @@ output "service_account_email" {
 output "pubsub_topic" {
   description = "Pub/Sub topic for triggering scans"
   value       = google_pubsub_topic.scan_trigger.name
+}
+
+output "os_policy_assignment" {
+  description = "OS Config policy assignment for Qualys scanning"
+  value       = google_os_config_os_policy_assignment.qualys_scanner.name
 }

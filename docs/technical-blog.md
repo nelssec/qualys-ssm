@@ -53,7 +53,8 @@ flowchart TB
     subgraph GCP
         AL["Audit Logs"] --> PS["Pub/Sub"]
         PS --> CF["Cloud Functions"]
-        CF --> GCE["Compute Engine"]
+        CF --> OSC["OS Config Agent"]
+        OSC --> GCE["Compute Engine"]
     end
 ```
 
@@ -439,8 +440,13 @@ flowchart TB
         Job["qualys-daily-scan<br/>cron: 0 2 * * *"]
     end
 
+    subgraph OSConfig["OS Config"]
+        Policy["OS Policy Assignment<br/>qualys-scanner-policy"]
+        Agent["OS Config Agent<br/>Pre-installed on VMs"]
+    end
+
     subgraph Compute["Compute Engine"]
-        VM["Target VM<br/>Startup Script / OS Config"]
+        VM["Target VM<br/>Label: qualys-scan=enabled"]
     end
 
     subgraph Hub["Hub Project"]
@@ -453,7 +459,9 @@ flowchart TB
     Job -->|"Publish"| Topic
     Topic --> Subscription
     Subscription -->|"Push"| Scanner
-    Scanner -->|"gcloud compute ssh"| VM
+    Scanner -->|"Set metadata<br/>qualys-scan-trigger=true"| VM
+    Policy -->|"Enforce"| Agent
+    Agent -->|"Check metadata<br/>Run scan script"| VM
     VM -->|"Access secret"| SecretMgr
     VM -->|"Upload objects"| GCS
 ```
@@ -468,12 +476,13 @@ sequenceDiagram
     participant LS as Log Sink
     participant PS as Pub/Sub Topic
     participant CF as Cloud Function
+    participant OSC as OS Config Agent
     participant SM as Secret Manager
     participant GCS as Cloud Storage
     participant Q as Qualys API
 
     Note over GCE,AL: VM Creation Event
-    GCE->>GCE: Create Instance
+    GCE->>GCE: Create Instance (label: qualys-scan=enabled)
     GCE->>AL: AuditLog: compute.instances.insert
     AL->>LS: Match filter: methodName="v1.compute.instances.insert"
     LS->>PS: Publish message
@@ -481,27 +490,26 @@ sequenceDiagram
     Note over PS,CF: Event Processing
     PS->>CF: Trigger (Pub/Sub push)
     CF->>CF: Parse instance name, zone, project
-    CF->>CF: Check labels (qualys-scan != disabled)
+    CF->>GCE: Set metadata: qualys-scan-trigger=true
 
-    Note over CF,GCE: Scan Execution via Metadata
-    CF->>GCE: Set startup-script metadata
-    GCE->>GCE: Execute startup script on next boot
-
-    Note over GCE,Q: Alternative: Direct SSH Execution
-    CF->>GCE: gcloud compute ssh --command="scan.sh"
+    Note over OSC,GCE: OS Config Policy Enforcement
+    OSC->>OSC: Check OS Policy Assignment
+    OSC->>GCE: Read metadata: qualys-scan-trigger
+    OSC->>OSC: Trigger detected, run enforce script
 
     Note over GCE,Q: Scan Execution
     GCE->>GCE: Download QScanner binary
     GCE->>GCE: Verify SHA256 checksum
-    GCE->>SM: gcloud secrets versions access latest --secret=qualys-ssm-scanner-credentials
+    GCE->>SM: Access secret via metadata token
     SM-->>GCE: {"qualys_pod": "US2", "qualys_access_token": "xxx"}
     GCE->>GCE: Run: qscanner --scan-types os,sca,fileinsight rootfs /
     GCE->>Q: Report vulnerabilities
-    GCE->>GCS: gsutil cp results gs://qualys-ssm-hub-{project}/scans/{project}/{instance}/{timestamp}/
+    GCE->>GCS: gsutil cp results gs://qualys-ssm-hub-{project}/scans/
     GCS-->>GCE: Upload complete
+    GCE->>GCE: Remove metadata: qualys-scan-trigger
 
-    Note over CF: Scan Complete
-    GCE-->>CF: Exit Code 0
+    Note over OSC: Scan Complete
+    OSC-->>OSC: Policy compliance achieved
 ```
 
 ### Key GCP Resources
@@ -509,6 +517,7 @@ sequenceDiagram
 | Resource | Type | Purpose |
 |----------|------|---------|
 | `qualys-vm-scanner` | Cloud Function Gen2 | Serverless compute, Python 3.12 |
+| `qualys-scanner-policy` | OS Policy Assignment | Executes scan script on VMs |
 | `qualys-scan-trigger` | Pub/Sub Topic | Event messaging |
 | `qualys-scan-trigger-sub` | Pub/Sub Subscription | Delivers messages to function |
 | `qualys-new-vm-trigger` | Log Sink | Routes audit logs to Pub/Sub |
@@ -542,11 +551,13 @@ flowchart LR
 
     subgraph Spoke2["Spoke Project"]
         GCE["Compute Instances"]
+        OSC["OS Config"]
     end
 
     SA -->|"roles/secretmanager.secretAccessor"| SM
     SA -->|"roles/storage.objectCreator"| GCS
     SA -->|"roles/compute.instanceAdmin.v1"| GCE
+    SA -->|"roles/osconfig.osPolicyAssignmentAdmin"| OSC
 ```
 
 ### Cloud Function Environment
